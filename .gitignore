@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# MacOS
+.DS_Store
+
+# Environment / secrets
+.env
+*.env
+
+# Data & DBs
+data/player_stats.db
+data/*.sqlite
+data/exports/
+data/raw/
+data/modeling/
+
+# Logs / temp
+logs/
+*.log

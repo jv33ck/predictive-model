@@ -1,0 +1,34 @@
+# === API & Config ===
+nba_api
+requests
+python-dotenv
+pydantic
+
+# === Data Processing ===
+pandas
+polars
+numpy
+
+# === Visualization ===
+matplotlib
+seaborn
+plotly
+
+# === Modeling & Statistics ===
+scikit-learn
+xgboost
+lightgbm
+catboost
+statsmodels
+pmdarima
+
+# === Notebook Support ===
+jupyterlab
+ipykernel
+
+# === Formatting & Linting ===
+black
+ruff
+
+# === Dev Tools ===
+pip-tools
