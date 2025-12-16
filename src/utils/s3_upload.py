@@ -1,4 +1,14 @@
 # src/utils/s3_upload.py
+"""
+Simple S3 upload helper for CSV / JSON artifacts.
+
+NOTE: The target bucket (`oddzup-stats-2025`) has ACLs disabled
+      (Bucket Owner Enforced). That means we must NOT set any ACL
+      such as "public-read" on uploads, or S3 will return
+      AccessControlListNotSupported.
+
+Public / client access should be handled via bucket policy, not ACLs.
+"""
 
 from __future__ import annotations
 
@@ -9,69 +19,81 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 
+def _infer_content_type(path: Path) -> str:
+    """Best-effort Content-Type based on file extension."""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return "text/csv"
+    if suffix == ".json":
+        return "application/json"
+    # Fallback generic type
+    return "application/octet-stream"
+
+
 def upload_to_s3(
-    local_path: Path,
+    path: str | Path,
     bucket: str,
     key: str,
-    public: bool = True,
-) -> Optional[str]:
+    *,
+    # kept for backwards compatibility; we NO LONGER set ACLs at all
+    public: Optional[bool] = None,
+    content_type: Optional[str] = None,
+    cache_control: Optional[str] = None,
+) -> str:
     """
     Upload a local file to S3.
 
     Parameters
     ----------
-    local_path : Path
-        Local file to upload (CSV/JSON/etc.).
+    path : str or Path
+        Local path to the file.
     bucket : str
-        S3 bucket name, e.g. "oddzup-stats-2025".
+        Target S3 bucket name.
     key : str
-        S3 object key, e.g. "season/player_profiles_from_db_2025-26.json".
-    public : bool
-        If True, sets ACL to public-read so the file is reachable via HTTPS.
+        S3 object key (path within bucket).
+    public : bool, optional
+        Ignored. Kept only for backwards compatibility. The bucket
+        has ACLs disabled, so all access control must be managed
+        via bucket policies instead of object ACLs.
+    content_type : str, optional
+        Optional explicit Content-Type. If omitted, inferred
+        from file extension.
+    cache_control : str, optional
+        Optional Cache-Control header.
 
     Returns
     -------
-    Optional[str]
-        Public HTTPS URL if upload succeeds, otherwise None.
+    str
+        The s3:// URL for the uploaded object.
     """
-    local_path = Path(local_path)
+    file_path = Path(path)
 
-    if not local_path.exists():
-        print(f"❌ Local file does not exist, cannot upload: {local_path}")
-        return None
+    if not file_path.exists():
+        raise FileNotFoundError(f"File does not exist: {file_path}")
+
+    if content_type is None:
+        content_type = _infer_content_type(file_path)
+
+    extra_args: dict[str, str] = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+    if cache_control:
+        extra_args["CacheControl"] = cache_control
 
     s3 = boto3.client("s3")
 
-    # Content type for nicer behavior in browsers / clients
-    if local_path.suffix == ".json":
-        content_type = "application/json"
-    elif local_path.suffix == ".csv":
-        content_type = "text/csv"
-    else:
-        content_type = "application/octet-stream"
-
-    extra_args = {"ContentType": content_type}
-    if public:
-        extra_args["ACL"] = "public-read"
+    print(f"☁️ Uploading {file_path} to s3://{bucket}/{key} ...")
 
     try:
-        s3.upload_file(
-            Filename=str(local_path),
-            Bucket=bucket,
-            Key=key,
-            ExtraArgs=extra_args,
-        )
-    except (BotoCoreError, ClientError) as e:
-        print(f"❌ Failed to upload {local_path} to s3://{bucket}/{key}: {e}")
-        return None
+        if extra_args:
+            s3.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)
+        else:
+            s3.upload_file(str(file_path), bucket, key)
+    except (BotoCoreError, ClientError) as exc:
+        # Surface a clear, single error
+        raise RuntimeError(
+            f"Failed to upload {file_path} to s3://{bucket}/{key}: {exc}"
+        ) from exc
 
-    # Build a nice HTTPS URL
-    region = s3.meta.region_name or "us-east-1"
-    if region == "us-east-1":
-        url = f"https://{bucket}.s3.amazonaws.com/{key}"
-    else:
-        url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-
-    print(f"✅ Uploaded {local_path} to s3://{bucket}/{key}")
-    print(f"🌐 Public URL: {url}")
-    return url
+    print(f"✅ Upload complete: s3://{bucket}/{key}")
+    return f"s3://{bucket}/{key}"

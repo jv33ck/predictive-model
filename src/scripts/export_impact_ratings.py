@@ -12,6 +12,7 @@ import pandas as pd
 from features.impact_dataset import build_lineup_stint_impact_for_team_season
 from features.impact_ridge import fit_ridge_impact_model
 from data.nba_api_provider import get_game_boxscore_traditional
+from db.impact_ratings_db import upsert_impact_ratings
 
 try:
     from utils.s3_upload import upload_to_s3
@@ -365,6 +366,20 @@ def export_impact_ratings_for_team(
         impact_final = impact_final.sort_values(
             by="impact_per_100", ascending=False
         ).reset_index(drop=True)
+
+    # 3b. Upsert into SQLite impact_ratings table
+    try:
+        upsert_impact_ratings(
+            team=team,
+            season=season_label,
+            ratings_df=impact_with_names,
+            db_path=db_path,
+        )
+    except Exception as e:
+        # Don’t kill the export if DB upsert fails; just warn.
+        print(
+            f"⚠️ Failed to upsert impact ratings into DB for {team} {season_label}: {e}"
+        )
 
     # ------------------------------------------------------------------ #
     # 4) Write CSV + JSON locally
