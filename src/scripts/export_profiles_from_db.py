@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+import numpy as np
 from utils.s3_upload import upload_to_s3
 import json
 
@@ -657,6 +658,62 @@ def aggregate_season_profiles(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
+    # ------------------------------------------------------------------
+    # EPM v0.1 – blended offensive/defensive value in points per 100
+    # ------------------------------------------------------------------
+
+    required_cols = [
+        "off_rating_box",
+        "def_rating_box",
+        "off_rating_per_100",
+        "def_rating_per_100",
+        "total_possessions",
+    ]
+    missing_epm_cols = [c for c in required_cols if c not in grouped.columns]
+    if missing_epm_cols:
+        print(
+            "⚠️ Cannot compute EPM – missing columns in season aggregate: "
+            f"{missing_epm_cols}"
+        )
+        # Still return grouped so the rest of the pipeline works
+        grouped["epm_off"] = np.nan
+        grouped["epm_def"] = np.nan
+        grouped["epm_net"] = np.nan
+        return grouped
+
+    # League means for centering (per season DataFrame)
+    mean_off_box = grouped["off_rating_box"].mean()
+    mean_def_box = grouped["def_rating_box"].mean()
+    mean_off_oncourt = grouped["off_rating_per_100"].mean()
+    mean_def_oncourt = grouped["def_rating_per_100"].mean()
+
+    # Centered offensive stats (higher = better than league)
+    grouped["off_box_centered"] = grouped["off_rating_box"] - mean_off_box
+    grouped["off_oncourt_centered"] = grouped["off_rating_per_100"] - mean_off_oncourt
+
+    # Centered defensive stats (higher = better than league, so invert)
+    # i.e. a lower def_rating than league is positive here.
+    grouped["def_box_centered"] = mean_def_box - grouped["def_rating_box"]
+    grouped["def_oncourt_centered"] = mean_def_oncourt - grouped["def_rating_per_100"]
+
+    # Raw EPM components (still in points per 100)
+    grouped["epm_off_raw"] = (
+        0.5 * grouped["off_box_centered"] + 0.5 * grouped["off_oncourt_centered"]
+    )
+    grouped["epm_def_raw"] = (
+        0.5 * grouped["def_box_centered"] + 0.5 * grouped["def_oncourt_centered"]
+    )
+    grouped["epm_net_raw"] = grouped["epm_off_raw"] + grouped["epm_def_raw"]
+
+    # Reliability / shrinkage based on total possessions
+    # At ~1500 poss, factor ~1; lower samples are shrunk toward 0
+    grouped["epm_reliability"] = np.sqrt(
+        grouped["total_possessions"].clip(lower=0) / 1500.0
+    ).clip(upper=1.0)
+
+    grouped["epm_off"] = grouped["epm_off_raw"] * grouped["epm_reliability"]
+    grouped["epm_def"] = grouped["epm_def_raw"] * grouped["epm_reliability"]
+    grouped["epm_net"] = grouped["epm_net_raw"] * grouped["epm_reliability"]
 
     # Round for presentation (but keep numeric)
     one_decimal_cols = [
@@ -676,6 +733,9 @@ def aggregate_season_profiles(df: pd.DataFrame) -> pd.DataFrame:
         "def_rating_box",
         "net_rating_box",
         "pace",
+        "epm_off",
+        "epm_def",
+        "epm_net",
     ]
 
     three_decimal_cols = [
@@ -754,6 +814,9 @@ def aggregate_season_profiles(df: pd.DataFrame) -> pd.DataFrame:
         "off_rating_per_100",
         "def_rating_per_100",
         "net_rating_per_100",
+        "epm_off",
+        "epm_def",
+        "epm_net",
     ]
 
     # Keep only columns that exist
