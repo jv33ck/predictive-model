@@ -7,8 +7,9 @@ for a set of teams:
 
   1) Update player stats DB for all target teams (via update_db_today.py)
   2) Rebuild full-season profiles from the DB (per team)
-  3) Export impact ratings (per team)
+  3) Export impact ratings (per team, and persist to DB)
   4) Export gameday profiles (local JSON + optional S3 upload)
+  5) Export gameday matchup features from the profiles + scoreboard
 
 Usage examples
 --------------
@@ -140,7 +141,7 @@ def _normalize_team_list(raw_teams: Sequence[str] | None) -> List[str]:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run daily pipeline for updating DB, profiles, impact, and gameday profiles."
+        description="Run daily pipeline for updating DB, profiles, impact, and gameday profiles/matchups."
     )
 
     parser.add_argument(
@@ -179,7 +180,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--upload-s3",
         action="store_true",
-        help="(Reserved) If set, will be wired to export_gameday_profiles.py S3 options later.",
+        help="If set, also upload gameday player profiles to S3 (gameday bucket/prefix).",
     )
 
     return parser.parse_args(argv)
@@ -191,7 +192,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     season_label: str = args.season_label
     date_str: str = args.date or _get_today_ymd()
     max_games: int = args.max_games
-    upload_s3: bool = args.upload_s3  # currently unused, reserved for future S3 wiring
+    upload_s3: bool = args.upload_s3
 
     print("====================================")
     print("🏀 Daily Player Pipeline")
@@ -236,6 +237,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         db_cmd.extend(["--teams", ",".join(teams)])
 
     _run_cmd(db_cmd)
+
     print("✅ Daily DB update complete.")
     print(f"   Updated teams: {teams}")
 
@@ -258,7 +260,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
         )
 
-        # 3) Export impact ratings
+        # 3) Export impact ratings (and persist to DB)
         print(f"3️⃣ [Impact] Exporting impact ratings for {team} ...")
         _run_cmd(
             [
@@ -275,7 +277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         print(f"✅ Finished steps 2–3 for {team}.")
 
-    # 4) Export gameday profiles (once, for the full set of teams)
+    # 4) Export gameday player profiles (once, for the full set of teams)
     print("\n------------------------------------")
     print("4️⃣ [Gameday] Exporting gameday player profiles ...")
 
@@ -298,11 +300,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
         )
 
-    # NOTE: the new export_gameday_profiles.py expects --s3-bucket / --s3-prefix
-    # if you want S3 upload. For now we only run it locally from this pipeline.
-    # Later we can add --s3-bucket / --s3-prefix to this script and pass them through.
-
     _run_cmd(gameday_cmd)
+
+    # 5) Export gameday matchup features
+    print("\n------------------------------------")
+    print("5️⃣ [Matchups] Exporting gameday matchup features ...")
+
+    matchup_cmd: list[str] = [
+        sys.executable,
+        "src/scripts/export_gameday_matchups.py",
+        "--season-label",
+        season_label,
+        "--date",
+        date_str,
+        "--teams",
+        ",".join(teams),
+    ]
+
+    _run_cmd(matchup_cmd)
 
     print("\n🎉 Daily pipeline completed successfully!")
     print(f"   Date:   {date_str}")

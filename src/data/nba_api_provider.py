@@ -1,5 +1,5 @@
 # src/data/nba_api_provider.py
-from datetime import date
+from datetime import date, datetime
 from typing import Tuple, List
 from requests.exceptions import ReadTimeout, RequestException
 
@@ -9,6 +9,7 @@ from nba_api.stats.static import teams as static_teams
 from nba_apiv3.stats.endpoints import playbyplayv3
 from nba_api.stats.endpoints import gamerotation
 from nba_api.stats.endpoints import boxscoretraditionalv3, boxscoreadvancedv3
+from nba_api.stats.endpoints import LeagueGameLog
 
 
 # --- Helper: map team abbreviations to NBA team IDs ---
@@ -332,3 +333,95 @@ def get_game_boxscore_advanced(game_id: str) -> pd.DataFrame:
     except Exception as e:
         print(f"⚠️ Error fetching BoxScoreAdvancedV3 for game {game_id}: {e}")
         return pd.DataFrame()
+
+
+def get_leaguegamelog_team(
+    season: str,
+    season_type: str = "Regular Season",
+    team_abbrev: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    direction: str = "ASC",
+    counter: int = 0,
+    league_id: str = "00",
+) -> pd.DataFrame:
+    """
+    Fetch team-level game logs from the LeagueGameLog endpoint.
+
+    This is a *fast* way to pull one row per team-game for a season,
+    including basic box score + plus/minus and game date, without
+    touching play-by-play.
+
+    Parameters
+    ----------
+    season : str
+        NBA API season string (e.g. '2025-26').
+    season_type : str, default 'Regular Season'
+        One of: 'Regular Season', 'Pre Season', 'Playoffs', 'All Star', 'All-Star'.
+    team_abbrev : str, optional
+        If provided (e.g. 'NYK'), filter results to that team only.
+        If None, return logs for all teams in the league.
+    date_from : str, optional
+        Lower bound date filter in 'MM/DD/YYYY'. If None, no lower bound.
+    date_to : str, optional
+        Upper bound date filter in 'MM/DD/YYYY'. If None, no upper bound.
+    direction : str, default 'ASC'
+        Sort direction, 'ASC' or 'DESC' on the `sorter` column.
+    counter : int, default 0
+        NBA API paging counter (usually 0 for full season).
+    league_id : str, default '00'
+        League ID (NBA = '00').
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns:
+        ['SEASON_ID', 'TEAM_ID', 'TEAM_ABBREVIATION', 'TEAM_NAME',
+         'GAME_ID', 'GAME_DATE', 'MATCHUP', 'WL', 'MIN',
+         'FGM', 'FGA', 'FG_PCT', 'FG3M', 'FG3A', 'FG3_PCT',
+         'FTM', 'FTA', 'FT_PCT', 'OREB', 'DREB', 'REB',
+         'AST', 'STL', 'BLK', 'TOV', 'PF', 'PTS', 'PLUS_MINUS',
+         'VIDEO_AVAILABLE']
+    """
+
+    # LeagueGameLog expects MM/DD/YYYY for date filters; allow the user
+    # to pass either MM/DD/YYYY directly or YYYY-MM-DD and we normalize.
+    def _normalize_date(d: str | None) -> str:
+        if not d:
+            return ""
+        d = d.strip()
+        # If it's already in MM/DD/YYYY, pass through.
+        if "/" in d:
+            return d
+        # Try to parse YYYY-MM-DD and convert.
+        try:
+            parsed = datetime.strptime(d, "%Y-%m-%d")
+            return parsed.strftime("%m/%d/%Y")
+        except ValueError:
+            # If parsing fails, just return as-is and let the API complain.
+            return d
+
+    date_from_norm = _normalize_date(date_from)
+    date_to_norm = _normalize_date(date_to)
+
+    gl = LeagueGameLog(
+        counter=counter,
+        direction=direction,
+        league_id=league_id,
+        player_or_team_abbreviation="T",
+        season=season,
+        season_type_all_star=season_type,
+        sorter="DATE",
+        date_from_nullable=date_from_norm,
+        date_to_nullable=date_to_norm,
+    )
+    df = gl.league_game_log.get_data_frame()
+
+    # Normalize team abbreviation to uppercase strings
+    df["TEAM_ABBREVIATION"] = df["TEAM_ABBREVIATION"].astype(str).str.upper()
+
+    if team_abbrev:
+        team_abbrev = team_abbrev.upper()
+        df = df[df["TEAM_ABBREVIATION"] == team_abbrev].copy()
+
+    return df

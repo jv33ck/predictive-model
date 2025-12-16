@@ -67,7 +67,15 @@ def build_possessions_with_lineups_for_game(
         raise RuntimeError(f"No possessions built for game {game_id}")
 
     # --- Fetch rotation -> stints -> lineup stints ---
-    rotation_df = _fetch_with_retries(get_game_rotation, game_id)
+    # Rotation fetch (patched)
+    try:
+        rotation_df = _fetch_with_retries(get_game_rotation, game_id)
+    except Exception as exc:
+        print(
+            f"⚠️ [Impact] Failed to load GameRotation for game {game_id}: {exc}. "
+            f"Skipping this game for possession/impact modeling."
+        )
+        return pd.DataFrame()
     if rotation_df.empty:
         raise RuntimeError(f"Empty GameRotation for game {game_id}")
 
