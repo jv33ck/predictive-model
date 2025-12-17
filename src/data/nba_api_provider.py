@@ -11,6 +11,7 @@ from nba_api.stats.endpoints import gamerotation
 from nba_api.stats.endpoints import boxscoretraditionalv3, boxscoreadvancedv3
 from nba_api.stats.endpoints import LeagueGameLog
 from nba_api.stats.endpoints import ScheduleLeagueV2
+from functools import lru_cache
 
 
 # --- Helper: map team abbreviations to NBA team IDs ---
@@ -137,6 +138,19 @@ def get_game_rotation(game_id: str) -> pd.DataFrame:
 
 
 # --- Public API functions (these are the ones the rest of your stack should use) ---
+
+
+@lru_cache(maxsize=1)
+def get_team_id_map() -> dict[int, str]:
+    """
+    Return a mapping from numeric TEAM_ID -> team abbreviation (TRICODE).
+
+    Uses nba_api.stats.static.teams and caches the result so that repeated
+    calls across the pipeline are cheap and do not hit the API again.
+    """
+    teams_data = static_teams.get_teams()
+    # Each item looks like: {'id': 1610612747, 'full_name': 'Los Angeles Lakers', 'abbreviation': 'LAL', ...}
+    return {int(t["id"]): str(t["abbreviation"]) for t in teams_data}
 
 
 def get_today_games_and_teams() -> Tuple[pd.DataFrame, List[str]]:
@@ -454,3 +468,61 @@ def get_schedule_league_v2(season: str, league_id: str = "00") -> pd.DataFrame:
 
     season_games = dataset.get_data_frame()
     return season_games
+
+
+def get_schedule_for_date(
+    date_str: str, season_label: str, league_id: str = "00"
+) -> pd.DataFrame:
+    """
+    Fetch the schedule for a single calendar date via ScheduleLeagueV2.
+
+    Parameters
+    ----------
+    date_str : str
+        Calendar date in 'YYYY-MM-DD' format (e.g. '2025-12-17').
+    season_label : str
+        Season string in 'YYYY-YY' format, e.g. '2025-26'.
+        This should already match nba_api's expected format.
+    league_id : str
+        League identifier, default '00' for NBA.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per scheduled game on that date, based on the SeasonGames
+        dataset from ScheduleLeagueV2. Typical columns include:
+          - gameId
+          - gameDate
+          - homeTeam_teamTricode / awayTeam_teamTricode
+          - plus other metadata from ScheduleLeagueV2.
+    """
+    # Reuse the full-season helper and then filter by date in Python.
+    season_games = get_schedule_league_v2(season=season_label, league_id=league_id)
+    if season_games.empty:
+        print(
+            f"⚠️ ScheduleLeagueV2 returned empty SeasonGames for "
+            f"season {season_label} / league_id={league_id}."
+        )
+        return season_games
+
+    df = season_games.copy()
+
+    # Normalize a canonical GAME_DATE column as datetime64[ns]
+    if "GAME_DATE" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    elif "GAME_DATE_EST" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE_EST"])
+    elif "gameDate" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["gameDate"])
+    else:
+        # Fallback: trust the input date_str for GAME_DATE
+        df["GAME_DATE"] = pd.to_datetime(date_str)
+
+    # Compare on calendar date only (no time component) without using .dt
+    target_ts = pd.to_datetime(date_str)
+    start_of_day = target_ts.normalize()
+    end_of_day = start_of_day + pd.Timedelta(days=1)
+
+    mask = (df["GAME_DATE"] >= start_of_day) & (df["GAME_DATE"] < end_of_day)
+    day_games = df.loc[mask].copy()
+    return day_games

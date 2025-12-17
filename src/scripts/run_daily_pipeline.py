@@ -10,6 +10,7 @@ for a set of teams:
   3) Export impact ratings (per team, and persist to DB)
   4) Export gameday profiles (local JSON + optional S3 upload)
   5) Export gameday matchup features from the profiles + schedule
+  6) Generate team-level matchup predictions from trained models
 
 Usage examples
 --------------
@@ -330,6 +331,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
 
     _run_cmd(matchup_cmd)
+
+    # 6) Generate team-level matchup predictions using the trained models
+    print("\n------------------------------------")
+    print("6️⃣ [Team Predictions] Generating team-level matchup predictions ...")
+
+    predict_cmd: list[str] = [
+        sys.executable,
+        "src/scripts/predict_team_matchups.py",
+        "--season-label",
+        season_label,
+        "--date",
+        date_str,
+    ]
+
+    _run_cmd(predict_cmd)
 
     print("\n🎉 Daily pipeline completed successfully!")
     print(f"   Date:   {date_str}")
