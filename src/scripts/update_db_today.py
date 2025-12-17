@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from typing import List, Optional, Set
 
 from data.nba_api_provider import get_today_games_and_teams
@@ -63,6 +64,30 @@ def _parse_game_id_list(skip_arg: str) -> Set[str]:
     return set(parts)
 
 
+def _is_non_fatal_stints_error(err: RuntimeError) -> bool:
+    """
+    Detect the specific 'no lineup stints built for game ...' style errors
+    that we want to treat as non-fatal for DB updates.
+
+    These come from downstream impact/rotation logic when GameRotation or
+    related nba_api endpoints are missing/corrupt for a specific game.
+    """
+    msg = str(err)
+    return "No lineup stints built for game" in msg or "No lineup stints built" in msg
+
+
+def _extract_game_id_from_error(err: RuntimeError) -> Optional[str]:
+    """
+    Try to pull a 10-digit GAME_ID out of the RuntimeError message so we can
+    suggest a concrete --skip-games flag to the user.
+    """
+    msg = str(err)
+    match = re.search(r"game\s+(\d{10})", msg)
+    if match:
+        return match.group(1)
+    return None
+
+
 def main() -> None:
     args = parse_args()
     max_games = None if args.max_games == -1 else args.max_games
@@ -103,10 +128,31 @@ def main() -> None:
                 skip_game_ids=skip_game_ids,
             )
         except RuntimeError as e:
+            # Special-case: lineup stints / rotation failures are non-fatal
+            if _is_non_fatal_stints_error(e):
+                print(
+                    f"⚠️ Non-fatal lineup-stints error while updating team {team}: {e}"
+                )
+                bad_game_id = _extract_game_id_from_error(e)
+                if bad_game_id:
+                    print(
+                        f"   Hint: you can also skip this game in future runs with:\n"
+                        f"   --skip-games {bad_game_id}"
+                    )
+                print(
+                    "   Boxscore-level player stats for other games are still in the DB; "
+                    "impact modeling can safely skip the problematic game."
+                )
+                # We still consider this team 'updated' for the purposes of the daily run.
+                updated_teams.append(team)
+                continue
+
+            # All other RuntimeErrors are treated as hard failures.
             print(f"❌ Failed to update DB for team {team}: {e}")
             failed_teams.append(team)
             continue
 
+        # If we got here, the team updated cleanly with no exceptions.
         updated_teams.append(team)
 
     print("\n✅ Daily DB update complete.")

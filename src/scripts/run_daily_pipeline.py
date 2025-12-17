@@ -6,10 +6,10 @@ One-command daily pipeline for refreshing all player-level artifacts
 for a set of teams:
 
   1) Update player stats DB for all target teams (via update_db_today.py)
-  2) Rebuild full-season profiles from the DB (per team)
+  2) Rebuild full-season profiles from the DB (for all target teams in one call)
   3) Export impact ratings (per team, and persist to DB)
   4) Export gameday profiles (local JSON + optional S3 upload)
-  5) Export gameday matchup features from the profiles + scoreboard
+  5) Export gameday matchup features from the profiles + schedule
 
 Usage examples
 --------------
@@ -36,11 +36,8 @@ import subprocess
 from datetime import datetime
 from typing import List, Sequence
 
-# We rely on nba_api to infer which teams play on a given date if --teams is not provided.
-try:
-    from nba_api.stats.endpoints import ScoreboardV2
-except ImportError:
-    ScoreboardV2 = None  # type: ignore[assignment]
+import pandas as pd
+from data.nba_api_provider import get_schedule_league_v2
 
 # Default S3 settings for gameday profile uploads
 S3_BUCKET_DEFAULT = "oddzup-stats-2025"
@@ -66,47 +63,62 @@ def _get_today_ymd() -> str:
     return datetime.today().strftime("%Y-%m-%d")
 
 
-def _get_teams_playing_on_date(date_str: str) -> List[str]:
+def _get_teams_playing_on_date(date_str: str, season_label: str) -> List[str]:
     """
-    Use nba_api ScoreboardV2 to infer which teams play on the given date.
+    Use ScheduleLeagueV2 (via nba_api_provider) to infer which teams play on a given date.
 
     Parameters
     ----------
     date_str : str
-        Date in 'YYYY-MM-DD'.
+        Date in 'YYYY-MM-DD' format.
+    season_label : str
+        Season string in 'YYYY-YY' format, e.g. '2025-26'. Passed through to ScheduleLeagueV2.
 
     Returns
     -------
-    list of team abbreviations (e.g. ['SAS', 'NYK']).
+    list[str]
+        Sorted list of team abbreviations (e.g. ['NYK', 'SAS']).
     """
-    if ScoreboardV2 is None:
-        raise RuntimeError(
-            "nba_api is not installed or could not be imported. "
-            "Install nba_api or provide --teams explicitly."
-        )
-
-    # nba_api expects MM/DD/YYYY
     try:
-        parsed = datetime.strptime(date_str, "%Y-%m-%d")
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError(
             f"Invalid --date format '{date_str}'. Expected YYYY-MM-DD."
         ) from exc
 
-    game_date_str = parsed.strftime("%m/%d/%Y")
-    print(f"📅 Resolving teams from schedule for {game_date_str} ...")
+    print(
+        f"📅 Resolving teams from ScheduleLeagueV2 for {date_str} (season={season_label})..."
+    )
 
-    sb = ScoreboardV2(game_date=game_date_str)
-    line_score = sb.line_score.get_data_frame()
+    schedule_df = get_schedule_league_v2(season_label)
+    if schedule_df.empty:
+        print("⚠️ ScheduleLeagueV2 returned no rows; cannot infer teams from schedule.")
+        return []
 
-    if "TEAM_ABBREVIATION" not in line_score.columns:
+    required_cols = {"gameDate", "homeTeam_teamTricode", "awayTeam_teamTricode"}
+    missing = required_cols.difference(schedule_df.columns)
+    if missing:
         raise RuntimeError(
-            "Unexpected response from ScoreboardV2; TEAM_ABBREVIATION column not found."
+            "Unexpected response from ScheduleLeagueV2; missing columns: "
+            + ", ".join(sorted(missing))
         )
 
-    teams = sorted({str(t) for t in line_score["TEAM_ABBREVIATION"].unique()})
-    print(f"📝 Teams detected for {date_str}: {teams}")
-    return teams
+    # Normalize dates
+    sched = schedule_df.copy()
+    sched["gameDate"] = pd.to_datetime(sched["gameDate"], errors="coerce").dt.date
+
+    day_games = sched[sched["gameDate"] == target_date]
+    if day_games.empty:
+        print(f"ℹ️ No scheduled games found in ScheduleLeagueV2 for {date_str}.")
+        return []
+
+    # Collect both home + away tricode abbreviations
+    home_teams = day_games["homeTeam_teamTricode"].astype(str).str.upper().tolist()
+    away_teams = day_games["awayTeam_teamTricode"].astype(str).str.upper().tolist()
+
+    teams_set = sorted(set(home_teams + away_teams))
+    print(f"📝 Teams detected for {date_str} from schedule: {teams_set}")
+    return teams_set
 
 
 def _normalize_team_list(raw_teams: Sequence[str] | None) -> List[str]:
@@ -211,11 +223,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         print(f"📌 Using explicit teams from CLI: {teams}")
     else:
-        # Auto-detect from NBA schedule for the given date
-        teams = _get_teams_playing_on_date(date_str)
+        # Auto-detect from NBA schedule for the given date using ScheduleLeagueV2
+        teams = _get_teams_playing_on_date(date_str, season_label)
         if not teams:
             raise RuntimeError(
-                f"No games found for {date_str}. "
+                f"No games found in the schedule for {date_str} (season={season_label}). "
                 "Provide --teams explicitly if this is unexpected."
             )
 
@@ -241,26 +253,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("✅ Daily DB update complete.")
     print(f"   Updated teams: {teams}")
 
-    # 2–3: per-team processing
+    # 2) Rebuild season profiles from DB once for all target teams
+    print("\n------------------------------------")
+    print("2️⃣ [Profiles] Rebuilding season profiles from DB for all target teams ...")
+
+    profiles_cmd: list[str] = [
+        sys.executable,
+        "src/scripts/export_profiles_from_db.py",
+        "--season-label",
+        season_label,
+        "--team",
+        ",".join(teams),
+    ]
+    _run_cmd(profiles_cmd)
+
+    # 3) Export impact ratings per team (and persist to DB)
     for team in teams:
         print("\n------------------------------------")
         print(f"🏷️  Team: {team}")
         print("------------------------------------")
 
-        # 2) Rebuild season profiles from DB
-        print(f"2️⃣ [Profiles] Rebuilding season profiles from DB for {team} ...")
-        _run_cmd(
-            [
-                sys.executable,
-                "src/scripts/export_profiles_from_db.py",
-                "--team",
-                team,
-                "--season-label",
-                season_label,
-            ]
-        )
-
-        # 3) Export impact ratings (and persist to DB)
         print(f"3️⃣ [Impact] Exporting impact ratings for {team} ...")
         _run_cmd(
             [
@@ -275,7 +287,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
         )
 
-        print(f"✅ Finished steps 2–3 for {team}.")
+        print(f"✅ Finished impact export for {team}.")
 
     # 4) Export gameday player profiles (once, for the full set of teams)
     print("\n------------------------------------")

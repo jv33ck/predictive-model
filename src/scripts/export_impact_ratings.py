@@ -13,6 +13,10 @@ from features.impact_dataset import build_lineup_stint_impact_for_team_season
 from features.impact_ridge import fit_ridge_impact_model
 from data.nba_api_provider import get_game_boxscore_traditional
 from db.impact_ratings_db import upsert_impact_ratings
+from db.player_reference_db import (
+    load_player_reference_map,
+    upsert_player_reference,
+)
 
 try:
     from utils.s3_upload import upload_to_s3
@@ -158,101 +162,182 @@ def _attach_player_names(
     Attach player_name to the impact DataFrame.
 
     Strategy:
-      1. Try to use names from SQLite DB (player_game_stats).
-      2. If that yields ~0 coverage, fall back to nba_api boxscores
-         for all games in stints_df via BoxScoreTraditionalV3.
+      1. Use player_game_stats in SQLite (DB-based names).
+      2. Fill remaining gaps from the player_reference cache.
+      3. For any still-missing names, fall back to nba_api boxscores
+         and cache the results into player_reference.
 
-    We normalize player_id values into a canonical digit-string
-    before joining, to handle cases like:
-        - 1630245 (int) vs '1630245' (text)
-        - 1630245.0 (float) vs '1630245'
-        - stray whitespace or other characters.
+    We normalize player_id values into canonical digit-strings and also
+    integer IDs to keep everything aligned across sources.
     """
     impact = impact_df.copy()
     if impact.empty:
         impact["player_name"] = np.nan
         return impact
 
-    # --------------------
-    # 1) Try DB-based join
-    # --------------------
+    # Ensure player_name column exists
+    if "player_name" not in impact.columns:
+        impact["player_name"] = np.nan
+    # Make sure player_name is an object dtype so we can safely assign strings
+    impact["player_name"] = impact["player_name"].astype("object")
+
+    # Normalize IDs in the impact dataframe
+    impact["player_id_norm"] = _normalize_player_id_series(impact["player_id"])
+    impact["player_id_int"] = pd.to_numeric(impact["player_id_norm"], errors="coerce")
+
+    # Pull season/team if present (for metadata in player_reference)
+    season_label: Optional[str] = (
+        str(impact["season"].iloc[0]) if "season" in impact.columns else None
+    )
+    team_abbrev: Optional[str] = (
+        str(impact["team"].iloc[0]) if "team" in impact.columns else None
+    )
+
+    # ------------------------------------------------------------------ #
+    # 1) DB-based names from player_game_stats
+    # ------------------------------------------------------------------ #
     names_df = _load_player_names_from_db(db_path)
 
     if names_df is not None and not names_df.empty:
         names = names_df.copy()
-        impact["player_id_norm"] = _normalize_player_id_series(impact["player_id"])
         names["player_id_norm"] = _normalize_player_id_series(names["player_id"])
+        names = names[names["player_id_norm"].notna()].copy()
 
-        # Drop rows where we couldn't infer a plausible ID on either side
-        impact_db = impact[impact["player_id_norm"].notna()].copy()
-        names_db = names[names["player_id_norm"].notna()].copy()
+        # Build mapping norm -> name from DB
+        name_map_db = (
+            names[["player_id_norm", "player_name"]]
+            .dropna(subset=["player_name"])
+            .drop_duplicates("player_id_norm")
+            .set_index("player_id_norm")["player_name"]
+            .astype(str)
+            .to_dict()
+        )
 
-        if not impact_db.empty and not names_db.empty:
-            merged = impact_db.merge(
-                names_db[["player_id_norm", "player_name"]].drop_duplicates(
-                    "player_id_norm"
-                ),
-                on="player_id_norm",
-                how="left",
-                validate="m:1",  # each impact row maps to at most one name
-            )
+        # Fill missing names from DB
+        mask_missing_db = (
+            impact["player_name"].isna() & impact["player_id_norm"].notna()
+        )
+        impact.loc[mask_missing_db, "player_name"] = impact.loc[
+            mask_missing_db, "player_id_norm"
+        ].map(name_map_db)
 
-            num_with_name = merged["player_name"].notna().sum()
-            print(
-                f"ℹ️ DB join attached names for {num_with_name}/{len(merged)} "
-                f"impact rows ({num_with_name / max(len(merged), 1):.1%} coverage)."
-            )
+        num_with_name_db = impact["player_name"].notna().sum()
+        print(
+            f"ℹ️ DB join attached names for {num_with_name_db}/{len(impact)} "
+            f"impact rows ({num_with_name_db / max(len(impact), 1):.1%} coverage)."
+        )
 
-            # If we got reasonable coverage, use this result
-            if num_with_name > 0:
-                # Recombine with any impact rows that had no player_id_norm
-                no_norm = impact[impact["player_id_norm"].isna()].copy()
-                no_norm["player_name"] = np.nan
-                merged = pd.concat(
-                    [merged.drop(columns=["player_id_norm"]), no_norm],
-                    ignore_index=True,
-                )
-                return merged
+        # Upsert these DB-derived names into player_reference for future runs
+        ref_map_from_db: Dict[int, str] = {}
+        for _, row in names.iterrows():
+            norm = row["player_id_norm"]
+            pname = row["player_name"]
+            if not norm or pd.isna(pname):
+                continue
+            try:
+                pid_int = int(norm)
+            except (TypeError, ValueError):
+                continue
+            ref_map_from_db[pid_int] = str(pname)
 
-            # If coverage is 0, we'll fall through to boxscore-based names below.
-        else:
-            print(
-                "ℹ️ DB join skipped because normalized player_id sets on DB/impact "
-                "were empty."
+        if ref_map_from_db:
+            upsert_player_reference(
+                ref_map_from_db,
+                db_path=db_path,
+                season_label=season_label,
+                team_abbrev=team_abbrev,
+                source="db_player_game_stats",
             )
     else:
         print("ℹ️ Skipping DB-based name join; no usable names loaded from DB.")
 
-    # ---------------------------------------
-    # 2) Fallback: boxscore-based name mapping
-    # ---------------------------------------
-    if stints_df is None or stints_df.empty:
-        print(
-            "⚠️ stints_df is None or empty, cannot build boxscore-based name map. "
-            "Returning impact_df with player_name = NaN."
+    # ------------------------------------------------------------------ #
+    # 2) player_reference cache-based names
+    # ------------------------------------------------------------------ #
+    ref_map = load_player_reference_map(db_path=db_path)
+    if ref_map:
+        mask_missing_cache = (
+            impact["player_name"].isna() & impact["player_id_int"].notna()
         )
-        impact["player_name"] = np.nan
-        return impact
-
-    name_map = _build_name_map_from_boxscores(stints_df)
-    if not name_map:
-        print(
-            "⚠️ Boxscore-based name map is empty; returning impact_df with "
-            "player_name = NaN."
+        # cast to pandas Int64 for safety, then to python int for mapping
+        player_ids_for_cache = impact.loc[mask_missing_cache, "player_id_int"].astype(
+            "Int64"
         )
-        impact["player_name"] = np.nan
-        return impact
+        impact.loc[mask_missing_cache, "player_name"] = player_ids_for_cache.map(
+            ref_map
+        )
 
-    impact["player_id_norm"] = _normalize_player_id_series(impact["player_id"])
-    impact["player_name"] = impact["player_id_norm"].map(name_map)
+        num_with_name_cache = impact["player_name"].notna().sum()
+        print(
+            f"ℹ️ player_reference cache attached names for "
+            f"{num_with_name_cache}/{len(impact)} impact rows "
+            f"({num_with_name_cache / max(len(impact), 1):.1%} coverage)."
+        )
+    else:
+        print("ℹ️ player_reference cache is empty; skipping cache-based name fill.")
 
-    num_with_name_box = impact["player_name"].notna().sum()
-    print(
-        f"ℹ️ Boxscore fallback attached names for {num_with_name_box}/{len(impact)} "
-        f"impact rows ({num_with_name_box / max(len(impact), 1):.1%} coverage)."
-    )
+    # ------------------------------------------------------------------ #
+    # 3) Boxscore fallback for any remaining gaps + cache them
+    # ------------------------------------------------------------------ #
+    remaining_missing = impact["player_name"].isna().sum()
 
-    return impact.drop(columns=["player_id_norm"])
+    if remaining_missing > 0 and stints_df is not None and not stints_df.empty:
+        print(
+            f"ℹ️ {remaining_missing} players still missing names after DB+cache; "
+            "falling back to boxscores..."
+        )
+        name_map_box = _build_name_map_from_boxscores(stints_df)
+
+        if name_map_box:
+            # Upsert boxscore-derived names into player_reference as well
+            ref_from_box: Dict[int, str] = {}
+            for pid_str, pname in name_map_box.items():
+                digits = "".join(ch for ch in str(pid_str) if ch.isdigit())
+                if not digits:
+                    continue
+                try:
+                    pid_int = int(digits)
+                except ValueError:
+                    continue
+                ref_from_box[pid_int] = pname
+
+            if ref_from_box:
+                upsert_player_reference(
+                    ref_from_box,
+                    db_path=db_path,
+                    season_label=season_label,
+                    team_abbrev=team_abbrev,
+                    source="boxscore_traditional",
+                )
+
+            # Fill remaining names using the boxscore map
+            mask_missing_box = (
+                impact["player_name"].isna() & impact["player_id_norm"].notna()
+            )
+            impact.loc[mask_missing_box, "player_name"] = impact.loc[
+                mask_missing_box, "player_id_norm"
+            ].map(name_map_box)
+
+            num_with_name_box = impact["player_name"].notna().sum()
+            print(
+                f"ℹ️ Boxscore fallback attached names for "
+                f"{num_with_name_box}/{len(impact)} impact rows "
+                f"({num_with_name_box / max(len(impact), 1):.1%} coverage)."
+            )
+        else:
+            print(
+                "⚠️ Boxscore-based name map is empty; returning impact_df with "
+                "some player_name still NaN."
+            )
+    elif remaining_missing > 0:
+        print(
+            "⚠️ Some player_name values are still missing and stints_df is empty; "
+            "cannot build boxscore-based names."
+        )
+
+    # Drop helper cols
+    impact = impact.drop(columns=["player_id_norm", "player_id_int"], errors="ignore")
+    return impact
 
 
 def _clean_strings_for_json(df: pd.DataFrame) -> pd.DataFrame:
@@ -312,12 +397,15 @@ def export_impact_ratings_for_team(
     )
 
     # ------------------------------------------------------------------ #
-    # 1) Build stint-level impact dataset
+    # 1) Build stint-level impact dataset (DB-backed & incremental)
     # ------------------------------------------------------------------ #
     stints_df = build_lineup_stint_impact_for_team_season(
         team_abbrev=team,
+        season_label=season_label,
         max_games=max_games,
+        db_path=str(db_path),
     )
+
     print(f"✅ Built stint dataset with {len(stints_df)} rows.")
 
     # ------------------------------------------------------------------ #
@@ -337,7 +425,7 @@ def export_impact_ratings_for_team(
     impact_core["team"] = team
     impact_core["season"] = season_label
 
-    # Attach names: try DB first, then boxscore fallback
+    # Attach names: DB → player_reference cache → boxscore fallback
     impact_with_names = _attach_player_names(
         impact_core,
         db_path=db_path,

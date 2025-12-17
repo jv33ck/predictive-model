@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Any
 
 import pandas as pd
+
+import json
+
+import numpy as np
 
 # DB path: project_root/data/player_stats.db
 DB_PATH = Path(__file__).resolve().parents[2] / "data" / "player_stats.db"
@@ -260,3 +264,149 @@ def insert_player_game_stats(per_game_df: pd.DataFrame) -> None:
 
     conn.commit()
     conn.close()
+
+    # ---------------------------------------------------------------------------
+
+
+# impact_lineup_stints: cache of stint-level impact rows per team/season
+#
+# We store each stint row as a JSON blob (stint_json) keyed by:
+#   (team, season, game_id, lineup_stint_index)
+#
+# This keeps the schema flexible: if the stint builder adds columns later,
+# they are still captured in the JSON without needing a DB migration.
+# ---------------------------------------------------------------------------
+
+IMPACT_LINEUP_STINTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS impact_lineup_stints (
+    team TEXT NOT NULL,
+    season TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    lineup_stint_index INTEGER NOT NULL,
+    stint_json TEXT NOT NULL,
+    PRIMARY KEY (team, season, game_id, lineup_stint_index)
+);
+"""
+
+
+def ensure_impact_lineup_stints_table(conn: sqlite3.Connection) -> None:
+    """
+    Ensure the impact_lineup_stints table exists.
+
+    This should be called once per process before reading/writing the table.
+    """
+    with conn:
+        conn.execute(IMPACT_LINEUP_STINTS_TABLE_SQL)
+
+
+def _json_default(obj: Any) -> Any:
+    """
+    Helper for json.dumps to handle numpy / pandas scalar types.
+
+    Converts numpy scalar types to native Python types so they serialize cleanly.
+    """
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
+def upsert_impact_lineup_stints_for_team_season(
+    conn: sqlite3.Connection,
+    team: str,
+    season: str,
+    stints: pd.DataFrame,
+) -> int:
+    """
+    Upsert stint-level rows for a given (team, season) into impact_lineup_stints.
+
+    Parameters
+    ----------
+    conn : sqlite3.Connection
+        Open connection to player_stats.db (use get_connection()).
+    team : str
+        Team abbreviation (e.g. 'NYK').
+    season : str
+        Season label (e.g. '2025-26').
+    stints : pd.DataFrame
+        DataFrame containing at least ['game_id', 'lineup_stint_index'] plus any
+        other columns produced by the stint builder. Each row is stored as a
+        JSON blob in 'stint_json'.
+
+    Returns
+    -------
+    int
+        Number of rows upserted.
+    """
+    if stints.empty:
+        return 0
+
+    if "game_id" not in stints.columns:
+        raise ValueError("stints DataFrame is missing required column 'game_id'.")
+    if "lineup_stint_index" not in stints.columns:
+        raise ValueError(
+            "stints DataFrame is missing required column 'lineup_stint_index'."
+        )
+
+    # Normalize to strings/ints for keys
+    rows: list[tuple[str, str, str, int, str]] = []
+    for _, row in stints.iterrows():
+        game_id = str(row["game_id"])
+        lineup_idx = int(row["lineup_stint_index"])
+        stint_json = json.dumps(row.to_dict(), default=_json_default)
+        rows.append((team, season, game_id, lineup_idx, stint_json))
+
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO impact_lineup_stints (
+                team, season, game_id, lineup_stint_index, stint_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(team, season, game_id, lineup_stint_index)
+            DO UPDATE SET
+                stint_json = excluded.stint_json
+            """,
+            rows,
+        )
+
+    return len(rows)
+
+
+def load_impact_lineup_stints_for_team_season(
+    conn: sqlite3.Connection,
+    team: str,
+    season: str,
+) -> pd.DataFrame:
+    """
+    Load all stint rows for (team, season) from impact_lineup_stints.
+
+    Returns a DataFrame reconstructed from the stored JSON blobs.
+    If no rows exist, returns an empty DataFrame.
+    """
+    cur = conn.execute(
+        """
+        SELECT stint_json
+        FROM impact_lineup_stints
+        WHERE team = ? AND season = ?
+        ORDER BY game_id, lineup_stint_index
+        """,
+        (team, season),
+    )
+
+    dicts: list[dict[str, Any]] = []
+    for (stint_json,) in cur.fetchall():
+        try:
+            d = json.loads(stint_json)
+            dicts.append(d)
+        except json.JSONDecodeError:
+            # Skip any corrupted rows rather than blowing up the whole load
+            continue
+
+    if not dicts:
+        return pd.DataFrame()
+
+    return pd.DataFrame(dicts)

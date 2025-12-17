@@ -32,16 +32,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-import pandas as pd
 
 from features.matchup_features import build_matchup_features_from_profiles
 from utils.s3_upload import upload_to_s3
 
-try:
-    from nba_api.stats.endpoints import ScoreboardV2
-except ImportError:
-    ScoreboardV2 = None  # type: ignore[assignment]
 
+import pandas as pd
+from data.nba_api_provider import get_schedule_league_v2
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,122 +82,78 @@ def _normalize_team_list(raw_teams: Sequence[str] | None) -> List[str]:
     return deduped
 
 
-def _get_scoreboard_games(date_str: str) -> pd.DataFrame:
+def _get_scheduled_games_for_date(
+    season_label: str,
+    date_str: str,
+    teams_filter: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     """
-    Fetch the scoreboard for a given date and ensure we have
-    HOME_TEAM_ABBREVIATION and VISITOR_TEAM_ABBREVIATION columns.
+    Use ScheduleLeagueV2 to get the list of games for a given date (and optional team filter).
 
-    We use ScoreboardV2 and, if necessary, derive abbreviations
-    from the line_score TEAM_ID/TEAM_ABBREVIATION mapping.
-
-    If there are no games or we cannot map abbreviations, we return
-    an EMPTY DataFrame instead of raising, so the caller can treat
-    it as "no matchups today".
+    Returns a dataframe with columns that mirror the old ScoreboardV2 GameHeader:
+    ['GAME_ID', 'GAME_DATE', 'HOME_TEAM_ABBREVIATION', 'VISITOR_TEAM_ABBREVIATION']
+    so downstream code can remain unchanged.
     """
-    if ScoreboardV2 is None:
-        raise RuntimeError(
-            "nba_api is not installed or could not be imported. "
-            "Install nba_api to use scoreboard-based matchup export."
-        )
-
-    dt = _parse_date(date_str)
-    game_date_str = dt.strftime("%m/%d/%Y")
-    print(f"📅 Fetching scoreboard for {game_date_str} ...")
-
-    sb = ScoreboardV2(game_date=game_date_str)
-
-    game_header = sb.game_header.get_data_frame()
-    line_score = sb.line_score.get_data_frame()
-
-    # No games at all for this date
-    if game_header.empty:
-        print(
-            "ℹ️ Scoreboard returned no games for this date; "
-            "no gameday matchups will be exported."
-        )
-        return game_header
-
-    # If the modern columns already exist, just use them.
-    expected_cols = ["HOME_TEAM_ABBREVIATION", "VISITOR_TEAM_ABBREVIATION"]
-    if all(col in game_header.columns for col in expected_cols):
-        print("ℹ️ Scoreboard game_header already has home/away abbreviations.")
-        return game_header
-
-    # Otherwise derive abbreviations from TEAM_ID -> TEAM_ABBREVIATION mapping.
-    required_game_header_cols = ["HOME_TEAM_ID", "VISITOR_TEAM_ID", "GAME_ID"]
-    if not all(col in game_header.columns for col in required_game_header_cols):
-        print(
-            "⚠️ ScoreboardV2.game_header is missing expected team ID columns; "
-            f"got columns: {list(game_header.columns)}. "
-            "Treating as no games for matchup export."
-        )
-        return pd.DataFrame()
-
-    if line_score.empty:
-        print(
-            "⚠️ ScoreboardV2.line_score returned no rows; "
-            "cannot derive team abbreviations. Treating as no games."
-        )
-        return pd.DataFrame()
-
-    if (
-        "TEAM_ID" not in line_score.columns
-        or "TEAM_ABBREVIATION" not in line_score.columns
-    ):
-        print(
-            "⚠️ ScoreboardV2.line_score is missing TEAM_ID or TEAM_ABBREVIATION; "
-            f"got columns: {list(line_score.columns)}. Treating as no games."
-        )
-        return pd.DataFrame()
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid date_str '{date_str}' (expected YYYY-MM-DD)."
+        ) from exc
 
     print(
-        "ℹ️ Deriving HOME_TEAM_ABBREVIATION / VISITOR_TEAM_ABBREVIATION from line_score..."
+        f"📅 Fetching schedule for {date_str} via ScheduleLeagueV2 (season={season_label})..."
     )
+    schedule_df = get_schedule_league_v2(season_label)
+    if schedule_df.empty:
+        print("⚠️ ScheduleLeagueV2 returned no rows; cannot build matchups.")
+        return pd.DataFrame()
 
-    # Build a mapping TEAM_ID -> TEAM_ABBREVIATION (global mapping is fine).
-    abbr_map = (
-        line_score[["TEAM_ID", "TEAM_ABBREVIATION"]]
-        .drop_duplicates()
-        .set_index("TEAM_ID")["TEAM_ABBREVIATION"]
-        .to_dict()
-    )
+    required_cols = {
+        "gameDate",
+        "gameId",
+        "homeTeam_teamTricode",
+        "awayTeam_teamTricode",
+    }
+    missing = required_cols.difference(schedule_df.columns)
+    if missing:
+        raise RuntimeError(
+            "Unexpected response from ScheduleLeagueV2; missing columns: "
+            + ", ".join(sorted(missing))
+        )
 
-    if not abbr_map:
+    df = schedule_df.copy()
+    df["gameDate"] = pd.to_datetime(df["gameDate"], errors="coerce").dt.date
+    day_games = df[df["gameDate"] == target_date]
+
+    if teams_filter:
+        team_set = {t.upper() for t in teams_filter}
+        # Build the mask directly on day_games to avoid index misalignment
+        mask = day_games["homeTeam_teamTricode"].astype(str).str.upper().isin(
+            team_set
+        ) | day_games["awayTeam_teamTricode"].astype(str).str.upper().isin(team_set)
+        day_games = day_games[mask]
+
+    if day_games.empty:
         print(
-            "⚠️ TEAM_ID -> TEAM_ABBREVIATION map is empty; "
-            "cannot derive abbreviations. Treating as no games."
+            f"ℹ️ No scheduled games found in ScheduleLeagueV2 for {date_str} "
+            f"with team filter={list(teams_filter) if teams_filter else None}."
         )
         return pd.DataFrame()
 
-    # Map abbreviations onto game_header
-    game_header = game_header.copy()
-    game_header["HOME_TEAM_ABBREVIATION"] = game_header["HOME_TEAM_ID"].map(abbr_map)
-    game_header["VISITOR_TEAM_ABBREVIATION"] = game_header["VISITOR_TEAM_ID"].map(
-        abbr_map
-    )
+    # Map to the same column names the rest of the script expects from the old ScoreboardV2 path
+    mapped = day_games.rename(
+        columns={
+            "gameId": "GAME_ID",
+            "gameDate": "GAME_DATE",
+            "homeTeam_teamTricode": "HOME_TEAM_ABBREVIATION",
+            "awayTeam_teamTricode": "VISITOR_TEAM_ABBREVIATION",
+        }
+    )[
+        ["GAME_ID", "GAME_DATE", "HOME_TEAM_ABBREVIATION", "VISITOR_TEAM_ABBREVIATION"]
+    ].copy()
 
-    # Filter out any rows where mapping failed (NaNs)
-    valid_mask = (
-        game_header["HOME_TEAM_ABBREVIATION"].notna()
-        & game_header["VISITOR_TEAM_ABBREVIATION"].notna()
-    )
-    mapped = game_header.loc[valid_mask].copy()
-
-    if mapped.empty:
-        print(
-            "⚠️ Failed to map HOME_TEAM_ID/VISITOR_TEAM_ID to abbreviations using line_score; "
-            "no games had valid abbreviations after mapping. Treating as no games."
-        )
-        return pd.DataFrame()
-
-    # Optional debug if some rows were dropped
-    dropped = len(game_header) - len(mapped)
-    if dropped > 0:
-        print(
-            f"⚠️ Dropped {dropped} game_header rows that lacked valid team abbreviations "
-            "after mapping from line_score."
-        )
-
+    print(f"✅ Found {len(mapped)} scheduled games for {date_str}.")
     return mapped
 
 
@@ -261,16 +214,18 @@ def export_gameday_matchups(cfg: MatchupConfig) -> Optional[Path]:
     print(f"   Loaded {len(profiles_df)} player rows from profiles JSON.")
 
     # 2) Fetch scoreboard and restrict to teams of interest
-    game_header = _get_scoreboard_games(cfg.date_str)
+    game_header = _get_scheduled_games_for_date(
+        season_label=cfg.season_label,
+        date_str=cfg.date_str,
+        teams_filter=cfg.teams_filter,
+    )
 
-    # If scoreboard gave us nothing usable, bail out gracefully.
     if game_header.empty:
         print(
-            f"ℹ️ No scoreboard games available for {cfg.date_str}; "
+            f"ℹ️ No scheduled games available for {cfg.date_str} (season={cfg.season_label}); "
             "no matchup features will be exported."
         )
-        return None
-
+        return
     # Ensure the expected columns are present now
     for col in ["GAME_ID", "HOME_TEAM_ABBREVIATION", "VISITOR_TEAM_ABBREVIATION"]:
         if col not in game_header.columns:

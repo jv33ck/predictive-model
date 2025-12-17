@@ -11,6 +11,10 @@ from nba_api.stats.endpoints import commonplayerinfo
 from features.impact_dataset import build_lineup_stint_impact_for_team_season
 from features.impact_ridge import fit_ridge_impact_model
 from db.player_stats_db import load_player_game_stats_for_season
+from db.player_reference_db import (
+    load_player_reference_map,
+    upsert_player_reference,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         default="data/modeling",
         help="Directory to write impact ratings CSV (default: data/modeling).",
     )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="data/player_stats.db",
+        help="Path to SQLite DB (player_stats.db). Default: data/player_stats.db",
+    )
     return parser.parse_args()
 
 
@@ -67,6 +77,7 @@ def main() -> None:
     max_games = None if args.max_games == -1 else args.max_games
     alpha = args.alpha
     min_stint_possessions = args.min_stint_possessions
+    db_path = Path(args.db_path)
 
     print(
         f"📊 Training impact model for team {team}, "
@@ -77,7 +88,9 @@ def main() -> None:
     # 1) Build lineup-stint impact dataset for this team
     stint_df = build_lineup_stint_impact_for_team_season(
         team_abbrev=team,
+        season_label=season_label,
         max_games=max_games,
+        db_path=str(db_path),
     )
     if stint_df.empty:
         print(f"⚠️ No lineup-stint data built for {team}; aborting.")
@@ -94,7 +107,11 @@ def main() -> None:
 
     print(f"✅ Model fitted; {len(impact_df)} players with impact estimates.")
 
-    # 3) Enrich with names from DB (player_game_stats) where possible
+    # 3) Attach player names as cheaply as possible:
+    #    (a) from player_game_stats in DB
+    #    (b) from player_reference cache
+    #    (c) finally from nba_api for any truly-missing IDs, and cache them.
+
     print("📥 Loading player_game_stats from DB to attach player names...")
     stats_df = load_player_game_stats_for_season(season_label=season_label)
 
@@ -126,39 +143,69 @@ def main() -> None:
     stats_df = stats_df.dropna(subset=["player_id_int"]).copy()
     stats_df["player_id_int"] = stats_df["player_id_int"].astype("int64")
 
-    # Build a mapping from player_id_int -> (team, player_name)
-    name_map = stats_df[["player_id_int", "team", "player_name"]].drop_duplicates(
-        subset=["player_id_int"]
+    # Build a mapping from player_id_int -> player_name from the DB
+    name_map_df = stats_df[["player_id_int", "player_name"]].dropna(
+        subset=["player_name"]
+    )
+    db_name_map: dict[int, str] = (
+        name_map_df.drop_duplicates(subset=["player_id_int"])
+        .set_index("player_id_int")["player_name"]
+        .astype(str)
+        .to_dict()
     )
 
-    # --- Align impact_df's IDs to the same int type and merge from DB ---
+    # Upsert these DB-derived names into the persistent player_reference table
+    if db_name_map:
+        upsert_player_reference(
+            db_name_map,
+            db_path=db_path,
+            season_label=season_label,
+            team_abbrev=team,
+            source="db_player_game_stats",
+        )
+
+    # --- Align impact_df's IDs to the same int type and merge names from DB ---
     impact_df["player_id_int"] = impact_df["player_id"].astype("int64")
 
+    # Merge from the stats_df-based name_map (first pass)
     impact_df = impact_df.merge(
-        name_map,
+        name_map_df.drop_duplicates(subset=["player_id_int"]),
         on="player_id_int",
         how="left",
+        suffixes=("", "_db"),
     )
 
-    # At this point, some rows (especially opponents whose teams you haven't
-    # processed into the DB) will still have player_name = NaN.
+    # If there was already a player_name column in impact_df, prefer existing non-null
+    if "player_name_db" in impact_df.columns:
+        impact_df["player_name"] = impact_df["player_name"].combine_first(
+            impact_df["player_name_db"]
+        )
+        impact_df = impact_df.drop(columns=["player_name_db"])
 
-    # --- Fallback: fetch missing names from nba_api for remaining players ---
+    # --- Second pass: consult player_reference cache for any remaining IDs ---
+    ref_map = load_player_reference_map(db_path=db_path)
+    if ref_map:
+        impact_df["player_name"] = impact_df["player_name"].combine_first(
+            impact_df["player_id_int"].map(ref_map)
+        )
+
+    # --- Third pass: fetch remaining missing names from nba_api, cache them ---
     missing_mask = impact_df["player_name"].isna()
     missing_ids = (
-        impact_df.loc[missing_mask, "player_id"]
+        impact_df.loc[missing_mask, "player_id_int"]
         .dropna()
         .astype("int64")
         .unique()
         .tolist()
     )
 
+    id_to_name_from_api: dict[int, str] = {}
+
     if missing_ids:
         print(
-            f"ℹ️ {len(missing_ids)} players missing names from DB; fetching from nba_api..."
+            f"ℹ️ {len(missing_ids)} players still missing names after DB+cache; "
+            f"fetching from nba_api..."
         )
-
-        id_to_name: dict[int, str] = {}
 
         for pid in missing_ids:
             try:
@@ -167,22 +214,30 @@ def main() -> None:
                 if not info_df.empty:
                     raw_name = info_df.loc[0, "DISPLAY_FIRST_LAST"]
                     name: str = str(raw_name)
-                    id_to_name[int(pid)] = name
+                    id_to_name_from_api[int(pid)] = name
                     print(f"   - {pid} → {name}")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"⚠️ Failed to fetch name for player_id={pid}: {e}")
             # Be a little gentle with the stats API
             time.sleep(0.6)
 
-        # Only fill where player_name is missing
-        mask = impact_df["player_name"].isna()
+        # Persist these newly-fetched names into player_reference for future runs
+        if id_to_name_from_api:
+            upsert_player_reference(
+                id_to_name_from_api,
+                db_path=db_path,
+                season_label=season_label,
+                team_abbrev=team,
+                source="nba_api_commonplayerinfo",
+            )
 
-        # Map player_id -> name for those rows
-        impact_df.loc[mask, "player_name"] = (
-            impact_df.loc[mask, "player_id"].astype("int64").map(id_to_name)
+        # Fill only where player_name is still missing
+        mask = impact_df["player_name"].isna()
+        impact_df.loc[mask, "player_name"] = impact_df.loc[mask, "player_id_int"].map(
+            id_to_name_from_api
         )
 
-    # Keep original player_id, drop helper int if you want
+    # Keep original player_id, drop helper int column
     impact_df = impact_df.drop(columns=["player_id_int"], errors="ignore")
 
     # 4) Save to CSV

@@ -10,6 +10,7 @@ from nba_apiv3.stats.endpoints import playbyplayv3
 from nba_api.stats.endpoints import gamerotation
 from nba_api.stats.endpoints import boxscoretraditionalv3, boxscoreadvancedv3
 from nba_api.stats.endpoints import LeagueGameLog
+from nba_api.stats.endpoints import ScheduleLeagueV2
 
 
 # --- Helper: map team abbreviations to NBA team IDs ---
@@ -425,3 +426,31 @@ def get_leaguegamelog_team(
         df = df[df["TEAM_ABBREVIATION"] == team_abbrev].copy()
 
     return df
+
+
+def get_schedule_league_v2(season: str, league_id: str = "00") -> pd.DataFrame:
+    """
+    Fetch the full NBA schedule for a given season via ScheduleLeagueV2.
+
+    Parameters
+    ----------
+    season : str
+        Season string in 'YYYY-YY' format, e.g. '2025-26'.
+    league_id : str
+        League identifier, default '00' for NBA.
+
+    Returns
+    -------
+    pd.DataFrame
+        The SeasonGames dataframe from ScheduleLeagueV2, with columns like:
+        ['leagueId', 'seasonYear', 'gameDate', 'gameId', 'homeTeam_teamTricode',
+         'awayTeam_teamTricode', ...].
+    """
+    endpoint = ScheduleLeagueV2(season=season, league_id=league_id)
+    dataset = endpoint.season_games
+    if dataset is None:
+        print("⚠️ ScheduleLeagueV2 returned no SeasonGames dataset.")
+        return pd.DataFrame()
+
+    season_games = dataset.get_data_frame()
+    return season_games

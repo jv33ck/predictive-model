@@ -1,4 +1,5 @@
 # src/features/impact_dataset.py
+# src/features/impact_dataset.py
 from __future__ import annotations
 
 from typing import Optional, List
@@ -19,6 +20,12 @@ from features.possession_lineups import attach_lineups_to_possessions
 from features.season_player_aggregate import (
     _infer_home_away_from_matchup,
     _fetch_with_retries,
+)
+from db.player_stats_db import (
+    get_connection,
+    ensure_impact_lineup_stints_table,
+    upsert_impact_lineup_stints_for_team_season,
+    load_impact_lineup_stints_for_team_season,
 )
 
 
@@ -329,36 +336,223 @@ def build_lineup_stint_impact_from_possessions(
 
 def build_lineup_stint_impact_for_team_season(
     team_abbrev: str,
+    season_label: Optional[str] = None,
     max_games: Optional[int] = None,
+    db_path: str = "data/player_stats.db",
+    force_recompute: bool = False,
 ) -> pd.DataFrame:
     """
-    Convenience wrapper:
+    Build (or incrementally extend) the lineup-stint impact dataset for a team/season,
+    using the DB-backed impact_lineup_stints cache.
 
-      1) Build the possession-level impact dataset for a team/season.
-      2) Aggregate to lineup-stint level using build_lineup_stint_impact_from_possessions().
+    High-level flow:
 
-    This yields one row per (game_id, lineup_stint_index, home/away lineups),
-    with possessions/points and net ratings for the home team.
+      1) Pull the team's regular-season schedule from stats.nba.com.
+      2) Filter to games strictly before today (to avoid incomplete PBP/rotations).
+      3) Open player_stats.db and ensure impact_lineup_stints exists.
+      4) Load any existing stint rows for (team, season).
+      5) For any *missing* games (or all games if force_recompute=True):
+           - Build possessions+lineups for that game.
+           - Aggregate to lineup stints via build_lineup_stint_impact_from_possessions().
+           - Upsert those stints into impact_lineup_stints.
+      6) Reload all stint rows for (team, season) from the DB and return as a DataFrame.
+
+    This keeps the heavy PBP/rotation work incremental: once a game's stints have
+    been built and cached, subsequent runs only process *new* games.
 
     Args:
-        team_abbrev: e.g. "ATL"
-        max_games:   Optional limit (None = all eligible games).
+        team_abbrev:
+            Team abbreviation, e.g. "NYK".
+        season_label:
+            Season label, e.g. "2025-26". If None, we infer from the schedule's
+            SEASON_ID, but all callers in the pipeline should pass this explicitly.
+        max_games:
+            Optional dev/testing limit. If > 0, we only consider the earliest
+            max_games eligible games in the schedule.
+        db_path:
+            Path to the SQLite DB (default "data/player_stats.db").
+        force_recompute:
+            If True, we recompute and upsert all games in the schedule window,
+            even if stints already exist in the DB for those games.
 
     Returns:
-        DataFrame with one row per lineup stint (both lineups) across all games.
+        DataFrame with one row per lineup stint across all cached games
+        for (team, season).
     """
+    from datetime import date
+
     team_abbrev = team_abbrev.upper()
-    impact_df = build_possession_impact_for_team_season(
-        team_abbrev=team_abbrev,
-        max_games=max_games,
-    )
-    if impact_df.empty:
+
+    # -----------------------------
+    # 1) Fetch regular-season schedule
+    # -----------------------------
+    games_df = _fetch_with_retries(get_team_regular_season_games, team_abbrev)
+    if games_df.empty:
+        raise RuntimeError(f"No regular season games found for team {team_abbrev}.")
+
+    # Ensure we have the columns we expect
+    required_cols = {"GameID", "GameDate", "MATCHUP"}
+    missing = required_cols - set(games_df.columns)
+    if missing:
+        raise RuntimeError(
+            f"Team schedule for {team_abbrev} is missing required columns: {sorted(missing)}"
+        )
+
+    # -----------------------------
+    # 2) Filter to games strictly before today
+    # -----------------------------
+    today_str = date.today().strftime("%Y-%m-%d")
+    games_df = games_df[games_df["GameDate"] < today_str].copy()
+
+    if games_df.empty:
+        print(
+            f"⚠️ No eligible regular season games for {team_abbrev} before {today_str}."
+        )
         return pd.DataFrame()
 
-    stint_df = build_lineup_stint_impact_from_possessions(impact_df)
-    if stint_df.empty:
+    games_df = games_df.sort_values("GameDate")
+
+    # Support the "-1 means all games" pattern used by CLI
+    if max_games is not None and max_games > 0:
+        games_df = games_df.head(max_games)
+
+    # -----------------------------
+    # 3) Determine season label
+    # -----------------------------
+    if season_label is None:
+        # Infer from SEASON_ID if available, else fall back to current season_id.
+        # SEASON_ID is typically like 22025 for 2025-26.
+        if "SEASON_ID" in games_df.columns and not games_df["SEASON_ID"].isna().all():
+            # Take the first non-null season id and convert to something like "2025-26"
+            season_id = str(games_df["SEASON_ID"].dropna().iloc[0])
+            # "22025" -> 2025-26 (simple mapping: last 4 digits are start year)
+            if len(season_id) >= 5:
+                start_year = int(season_id[-4:])
+                season_label = f"{start_year}-{str(start_year + 1)[-2:]}"
+            else:
+                season_label = "unknown"
+        else:
+            season_label = "unknown"
+
+    # -----------------------------
+    # 4) Open DB and ensure table / load existing stints
+    # -----------------------------
+    # -----------------------------
+    # 4) Open DB and ensure table / load existing stints
+    # -----------------------------
+    conn = get_connection()  # uses the default DB path from player_stats_db
+    ensure_impact_lineup_stints_table(conn)
+
+    existing_stints = load_impact_lineup_stints_for_team_season(
+        conn=conn,
+        team=team_abbrev,
+        season=season_label,
+    )
+
+    existing_game_ids: set[str] = set()
+    if not existing_stints.empty and "game_id" in existing_stints.columns:
+        existing_game_ids = set(existing_stints["game_id"].astype(str).unique())
+
+    # -----------------------------
+    # 5) Figure out which games need (re)computation
+    # -----------------------------
+    games_to_process: list[tuple[str, str, str, str]] = []
+    # (game_id, game_date, matchup, team_for_matchup)
+
+    for _, row in games_df.iterrows():
+        game_id = str(row["GameID"])
+        game_date = str(row["GameDate"])
+        matchup = str(row["MATCHUP"])
+        team_for_matchup = row["Team"] if "Team" in row else team_abbrev
+
+        if not force_recompute and game_id in existing_game_ids:
+            # Already cached in DB; skip heavy work.
+            continue
+
+        games_to_process.append((game_id, game_date, matchup, team_for_matchup))
+
+    if not games_to_process and not existing_stints.empty:
+        # Nothing new to compute; just return what we already have.
         print(
-            f"⚠️ No lineup stints could be aggregated for team {team_abbrev}; "
-            "stint-level impact dataset is empty."
+            f"ℹ️ [Impact] All eligible games for {team_abbrev} / {season_label} "
+            "are already cached in impact_lineup_stints."
         )
-    return stint_df
+        conn.close()
+        # Normalize types a bit for downstream
+        if "game_id" in existing_stints.columns:
+            existing_stints["game_id"] = existing_stints["game_id"].astype(str)
+        for col in ["home_team", "away_team"]:
+            if col in existing_stints.columns:
+                existing_stints[col] = existing_stints[col].astype(str).str.upper()
+        return existing_stints
+
+    # -----------------------------
+    # 6) Build stints for missing games and upsert into DB
+    # -----------------------------
+    for game_id, game_date, matchup, team_for_matchup in games_to_process:
+        print(
+            f"\n🎬 [Impact] Processing GameID {game_id} "
+            f"({matchup}) on {game_date} for team {team_abbrev}..."
+        )
+        try:
+            enriched = build_possessions_with_lineups_for_game(
+                game_id=game_id,
+                team_abbrev=team_for_matchup,
+                matchup=matchup,
+            )
+            if enriched.empty:
+                print(
+                    f"⚠️ [Impact] Possession+lineup dataset empty for game {game_id}; skipping."
+                )
+                continue
+
+            game_stints = build_lineup_stint_impact_from_possessions(enriched)
+            if game_stints.empty:
+                print(
+                    f"⚠️ [Impact] No lineup stints aggregated for game {game_id}; skipping."
+                )
+                continue
+
+        except Exception as exc:
+            # We *skip* problematic games rather than failing the entire pipeline.
+            print(
+                f"⚠️ [Impact] Skipping game {game_id} for {team_abbrev} due to error: {exc}"
+            )
+            continue
+
+        # Persist to DB (upsert by (team, season, game_id, lineup_stint_index))
+        upserted = upsert_impact_lineup_stints_for_team_season(
+            conn=conn,
+            team=team_abbrev,
+            season=season_label,
+            stints=game_stints,
+        )
+        print(
+            f"💾 [Impact] Upserted {upserted} lineup stints for game {game_id} "
+            f"into impact_lineup_stints."
+        )
+
+    # -----------------------------
+    # 7) Reload all stints for (team, season) from DB and normalize
+    # -----------------------------
+    all_stints = load_impact_lineup_stints_for_team_season(
+        conn=conn,
+        team=team_abbrev,
+        season=season_label,
+    )
+    conn.close()
+
+    if all_stints.empty:
+        print(
+            f"⚠️ [Impact] No lineup stints stored in DB for {team_abbrev} / {season_label}."
+        )
+        return all_stints
+
+    # Normalize a few key columns for downstream consumers (ridge, exports, etc.)
+    if "game_id" in all_stints.columns:
+        all_stints["game_id"] = all_stints["game_id"].astype(str)
+    for col in ["home_team", "away_team"]:
+        if col in all_stints.columns:
+            all_stints[col] = all_stints[col].astype(str).str.upper()
+
+    return all_stints

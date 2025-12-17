@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 
 from features.impact_dataset import build_lineup_stint_impact_for_team_season
+from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,10 +21,22 @@ def parse_args() -> argparse.Namespace:
         help="Team abbreviation, e.g. 'ATL' or 'OKC'.",
     )
     parser.add_argument(
+        "--season-label",
+        type=str,
+        default="2025-26",
+        help="Season label used in your DB/exports (default: 2025-26).",
+    )
+    parser.add_argument(
         "--max-games",
         type=int,
         default=3,
         help="Max number of games to process (default: 3, use -1 for all).",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="data/player_stats.db",
+        help="Path to SQLite DB (player_stats.db). Default: data/player_stats.db",
     )
     return parser.parse_args()
 
@@ -31,13 +44,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     team = args.team.strip().upper()
-    max_games = (
-        None if args.max_games == -1 else args.max_games
-    )  # <- fix this typo when you paste: max_games
+    max_games = None if args.max_games == -1 else args.max_games
+    db_path = Path(args.db_path)
+    season_label = args.season_label
 
     stint_df = build_lineup_stint_impact_for_team_season(
         team_abbrev=team,
         max_games=max_games,
+        season_label=season_label,
+        db_path=str(db_path),
     )
 
     if stint_df.empty:
