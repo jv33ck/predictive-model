@@ -40,5 +40,5 @@
     "workbench.colorCustomizations": {
 
     },
-    
+    "python.analysis.diagnosticMode": "workspace"
 }
