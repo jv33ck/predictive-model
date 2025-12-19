@@ -1,0 +1,83 @@
+{
+  "created_at": "2025-12-17T23:56:15.756623Z",
+  "train_json": "data/training/player_train_2025-26_oct-nov.json",
+  "output_dir": "data/models/player",
+  "test_size": 0.2,
+  "random_state": 42,
+  "targets": [
+    "pts",
+    "treb",
+    "ast"
+  ],
+  "feature_columns": [
+    "game_id",
+    "minutes_played",
+    "off_possessions",
+    "def_possessions",
+    "total_possessions",
+    "fgm",
+    "fga",
+    "fg3m",
+    "fg3a",
+    "ftm",
+    "fta",
+    "oreb",
+    "dreb",
+    "stl",
+    "blk",
+    "tov",
+    "pf",
+    "plus_minus",
+    "ts_pct",
+    "efg_pct",
+    "usg_pct",
+    "est_usg_pct",
+    "oreb_pct",
+    "dreb_pct",
+    "reb_pct",
+    "ast_pct",
+    "tov_ratio",
+    "off_rating_box",
+    "def_rating_box",
+    "net_rating_box",
+    "pace",
+    "possessions_est",
+    "off_rating_per_100",
+    "def_rating_per_100",
+    "net_rating_per_100",
+    "is_home",
+    "games_before",
+    "days_since_prev_game",
+    "pts_prev_mean_all",
+    "pts_prev_mean_5",
+    "treb_prev_mean_all",
+    "treb_prev_mean_5",
+    "ast_prev_mean_all",
+    "ast_prev_mean_5",
+    "minutes_played_prev_mean_all",
+    "minutes_played_prev_mean_5"
+  ],
+  "metrics": {
+    "pts": {
+      "target": "pts",
+      "n_train": 6346,
+      "n_test": 1587,
+      "mae": 0.1227347195967234,
+      "rmse": 0.4278338929416303
+    },
+    "treb": {
+      "target": "treb",
+      "n_train": 6346,
+      "n_test": 1587,
+      "mae": 0.016988027725267807,
+      "rmse": 0.11944984552297731
+    },
+    "ast": {
+      "target": "ast",
+      "n_train": 6346,
+      "n_test": 1587,
+      "mae": 0.13762602394454948,
+      "rmse": 0.37127766615772034
+    }
+  }
+}

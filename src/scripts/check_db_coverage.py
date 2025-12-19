@@ -9,9 +9,7 @@ import pandas as pd
 # ✅ Uses your existing nba_api wrapper
 from data.nba_api_provider import get_schedule_for_date
 
-# ✅ Reuse the same DB connection pattern your DB scripts use.
-# If your engine helper lives somewhere else, just change this import.
-from db.session import get_engine, get_session  # type: ignore # adjust if needed
+from db.player_stats_db import get_connection  # add this import
 
 
 def build_schedule_df(
@@ -25,17 +23,21 @@ def build_schedule_df(
     cur = start_date
     while cur <= end_date:
         print(f"📅 Fetching schedule for {cur} ...")
-        sched = get_schedule_for_date(
-            cur.strftime("%Y-%m-%d"), season_label=season_label
-        )
+        sched = get_schedule_for_date(cur.isoformat(), season_label=season_label)
         if sched.empty:
             cur += timedelta(days=1)
             continue
 
         # Normalize expected columns
-        if "GAME_ID" not in sched.columns:
+        game_id_col: str | None = None
+        for cand in ["GAME_ID", "gameId", "game_id"]:
+            if cand in sched.columns:
+                game_id_col = cand
+                break
+
+        if game_id_col is None:
             raise RuntimeError(
-                f"Schedule for {cur} missing GAME_ID column; got columns={sched.columns}"
+                f"Schedule for {cur} missing game id column; got columns={sched.columns}"
             )
 
         # Some versions name the date column differently; keep it simple
@@ -55,9 +57,9 @@ def build_schedule_df(
         sched["game_date"] = pd.to_datetime(sched[game_date_col]).dt.date
 
         rows.append(
-            sched[["GAME_ID", "game_date"]]
+            sched[[game_id_col, "game_date"]]
             .drop_duplicates()
-            .rename(columns={"GAME_ID": "game_id"})
+            .rename(columns={game_id_col: "game_id"})
         )
         cur += timedelta(days=1)
 
@@ -70,44 +72,62 @@ def build_schedule_df(
 
 def load_db_games() -> pd.DataFrame:
     """
-    Load distinct game_ids that are present in player_game_stats.
+    Load distinct game IDs from the SQLite DB using player_stats_db.
 
-    We don't assume a season column here – we just look at all games
-    the DB knows about.
+    Reads from player_game_stats in data/player_stats.db and returns a DataFrame
+    with a single column game_id (lowercase) to match schedule.
     """
-    engine = get_engine()
-    # This assumes a table named player_game_stats with a game_id column,
-    # which is how your other scripts refer to it.
-    df = pd.read_sql("SELECT DISTINCT game_id FROM player_game_stats", con=engine)
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            "SELECT DISTINCT game_id AS game_id FROM player_game_stats",
+            conn,
+        )
+    finally:
+        conn.close()
+
     if "game_id" not in df.columns:
         raise RuntimeError(
-            f"player_game_stats query did not return a game_id column; got {df.columns}"
+            f"Expected column 'game_id' in DB query result, got columns={df.columns}"
         )
+
     return df
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the DB coverage check script."""
     parser = argparse.ArgumentParser(
-        description="Check which scheduled games are missing from the DB."
+        description=(
+            "Check which scheduled NBA games in a date range are missing from "
+            "the local player_game_stats table."
+        )
     )
+
     parser.add_argument(
         "--season-label",
-        type=str,
         required=True,
-        help="Season label, e.g. 2025-26",
+        help=(
+            "Season label string used for schedule calls, e.g. '2025-26'. "
+            "This should match what your other scripts use."
+        ),
     )
+
     parser.add_argument(
         "--start-date",
-        type=str,
-        default="2025-10-22",
-        help="Start date (YYYY-MM-DD) for coverage check.",
+        required=True,
+        help="Start date for coverage check in YYYY-MM-DD format.",
     )
+
     parser.add_argument(
         "--end-date",
-        type=str,
-        default="",
-        help="End date (YYYY-MM-DD) for coverage check; default = today.",
+        required=False,
+        default=None,
+        help=(
+            "Optional end date for coverage check in YYYY-MM-DD format. "
+            "If omitted, defaults to today."
+        ),
     )
+
     return parser.parse_args()
 
 
