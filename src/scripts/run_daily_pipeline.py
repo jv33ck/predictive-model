@@ -1,354 +1,411 @@
 #!/usr/bin/env python
 """
-run_daily_pipeline.py
+Daily player+team modeling pipeline.
 
-One-command daily pipeline for refreshing all player-level artifacts
-for a set of teams:
-
-  1) Update player stats DB for all target teams (via update_db_today.py)
-  2) Rebuild full-season profiles from the DB (for all target teams in one call)
-  3) Export impact ratings (per team, and persist to DB)
-  4) Export gameday profiles (local JSON + optional S3 upload)
-  5) Export gameday matchup features from the profiles + schedule
-  6) Generate team-level matchup predictions from trained models
-
-Usage examples
---------------
-
-# Easiest: auto-detect teams playing today (system date), full-season impact
-PYTHONPATH=src python src/scripts/run_daily_pipeline.py --season-label 2025-26
-
-# Explicit teams (e.g., for testing SAS and NYK only)
-PYTHONPATH=src python src/scripts/run_daily_pipeline.py \
-  --season-label 2025-26 \
-  --teams NYK SAS
-
-# Also supported:
-# PYTHONPATH=src python src/scripts/run_daily_pipeline.py \
-#   --season-label 2025-26 \
-#   --teams NYK,SAS
+Steps:
+  1) Update DB for target teams (boxscores + lineup stints)
+  2) Export season-long player profiles from DB
+  3) Export impact ratings for each team
+  4) Export gameday player profiles (and upload to S3 if requested)
+  5) Export gameday matchup features
+  6) Generate team-level matchup predictions
+  7) Generate gameday player-level stat predictions
+  8) Combine team + player predictions into a single matchup file
+     and upload to S3 (if requested)
 """
 
-from __future__ import annotations
-
 import argparse
-import sys
+import datetime as dt
 import subprocess
-from datetime import datetime
-from typing import List, Sequence
+import sys
+from typing import List
 
-import pandas as pd
-from data.nba_api_provider import get_schedule_league_v2
-
-# Default S3 settings for gameday profile uploads
-S3_BUCKET_DEFAULT = "oddzup-stats-2025"
-S3_PREFIX_DEFAULT = "gameday"
+import pandas as pd  # type: ignore[import-untyped]
+from nba_api.stats.endpoints import ScheduleLeagueV2  # type: ignore[import-untyped]
 
 
-def _run_cmd(args: Sequence[str]) -> None:
-    """Run a subprocess command with logging and error propagation."""
-    cmd_str = " ".join(args)
-    print(f"\n💻 Running: {cmd_str}")
-    try:
-        subprocess.run(args, check=True)
-    except subprocess.CalledProcessError as exc:
-        print(
-            f"❌ Command failed with exit code {exc.returncode}: {cmd_str}",
-            file=sys.stderr,
-        )
-        raise
+DEFAULT_S3_BUCKET = "oddzup-stats-2025"
+DEFAULT_S3_PREFIX = "gameday"
 
 
-def _get_today_ymd() -> str:
-    """Return today's date in YYYY-MM-DD (local system time)."""
-    return datetime.today().strftime("%Y-%m-%d")
+# Local helper: fetch NBA schedule for a date via nba_api.
 
 
-def _get_teams_playing_on_date(date_str: str, season_label: str) -> List[str]:
+def get_schedule_for_date(
+    date_str: str, season_label: str | None = None
+) -> pd.DataFrame:
+    """Fetch NBA schedule for a single calendar date via nba_api.
+
+    This implementation avoids passing date-specific keyword arguments to
+    ScheduleLeagueV2 (which vary across nba_api versions). Instead, it
+    optionally filters by season on the API side and then filters by date
+    locally in pandas.
     """
-    Use ScheduleLeagueV2 (via nba_api_provider) to infer which teams play on a given date.
+    # Conservative kwargs: only pass season if provided so we work across
+    # nba_api versions that may not support date_from_nullable/game_date.
+    kwargs: dict[str, object] = {}
+    if season_label is not None:
+        kwargs["season"] = season_label
 
-    Parameters
-    ----------
-    date_str : str
-        Date in 'YYYY-MM-DD' format.
-    season_label : str
-        Season string in 'YYYY-YY' format, e.g. '2025-26'. Passed through to ScheduleLeagueV2.
+    endpoint = ScheduleLeagueV2(**kwargs)  # type: ignore[call-arg]
+    df = endpoint.get_data_frames()[0]
 
-    Returns
-    -------
-    list[str]
-        Sorted list of team abbreviations (e.g. ['NYK', 'SAS']).
-    """
-    try:
-        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid --date format '{date_str}'. Expected YYYY-MM-DD."
-        ) from exc
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
 
-    print(
-        f"📅 Resolving teams from ScheduleLeagueV2 for {date_str} (season={season_label})..."
-    )
+    if df.empty:
+        return df
 
-    schedule_df = get_schedule_league_v2(season_label)
-    if schedule_df.empty:
-        print("⚠️ ScheduleLeagueV2 returned no rows; cannot infer teams from schedule.")
-        return []
+    # Normalize and filter by the game date using common schedule columns.
+    target_date = pd.to_datetime(date_str).date()
+    candidate_date_cols = [
+        "GAME_DATE",
+        "GAME_DATE_EST",
+        "GAME_DATE_LCL",
+        "GAME_DATE_NBA",
+        "gameDate",
+    ]
 
-    required_cols = {"gameDate", "homeTeam_teamTricode", "awayTeam_teamTricode"}
-    missing = required_cols.difference(schedule_df.columns)
-    if missing:
-        raise RuntimeError(
-            "Unexpected response from ScheduleLeagueV2; missing columns: "
-            + ", ".join(sorted(missing))
-        )
+    for col in candidate_date_cols:
+        if col in df.columns:
+            tmp = df.copy()
+            tmp[col] = pd.to_datetime(tmp[col]).dt.date
+            filtered = tmp[tmp[col] == target_date].copy()
+            if not filtered.empty:
+                return filtered
 
-    # Normalize dates
-    sched = schedule_df.copy()
-    sched["gameDate"] = pd.to_datetime(sched["gameDate"], errors="coerce").dt.date
-
-    day_games = sched[sched["gameDate"] == target_date]
-    if day_games.empty:
-        print(f"ℹ️ No scheduled games found in ScheduleLeagueV2 for {date_str}.")
-        return []
-
-    # Collect both home + away tricode abbreviations
-    home_teams = day_games["homeTeam_teamTricode"].astype(str).str.upper().tolist()
-    away_teams = day_games["awayTeam_teamTricode"].astype(str).str.upper().tolist()
-
-    teams_set = sorted(set(home_teams + away_teams))
-    print(f"📝 Teams detected for {date_str} from schedule: {teams_set}")
-    return teams_set
+    # If we cannot find/normalize a date column, fall back to the raw
+    # DataFrame; infer_teams_for_date will raise a helpful error if no teams
+    # can be extracted.
+    return df
 
 
-def _normalize_team_list(raw_teams: Sequence[str] | None) -> List[str]:
-    """
-    Normalize a raw --teams argument into a clean, deduplicated list.
-
-    Supports:
-      --teams NYK SAS
-      --teams NYK,SAS
-      --teams NYK SAS,LAL
-    """
-    teams: List[str] = []
-    if not raw_teams:
-        return teams
-
-    for token in raw_teams:
-        # Allow comma-separated inside a single token.
-        for part in token.split(","):
-            code = part.strip().upper()
-            if code:
-                teams.append(code)
-
-    # De-duplicate while preserving order
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for t in teams:
-        if t not in seen:
-            seen.add(t)
-            deduped.append(t)
-    return deduped
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run daily pipeline for updating DB, profiles, impact, and gameday profiles/matchups."
-    )
-
-    parser.add_argument(
-        "--season-label",
-        required=True,
-        help="Season label string, e.g. '2025-26'.",
+        description="Run the full daily OddzUp modeling pipeline.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--date",
+        type=str,
+        default=None,
+        help="Gameday date (YYYY-MM-DD). Defaults to today.",
+    )
+    parser.add_argument(
+        "--season-label",
+        type=str,
         default=None,
         help=(
-            "Target date in YYYY-MM-DD for schedule / gameday profiles. "
-            "Defaults to today's date if not provided."
+            "Season label used in exports and logs, e.g. '2025-26'. "
+            "If omitted, it will be inferred from --date (or today)."
         ),
     )
     parser.add_argument(
         "--teams",
-        nargs="*",
-        default=None,
-        help=(
-            "Optional explicit list of team abbreviations to process "
-            "(e.g. SAS NYK or SAS,NYK). "
-            "If omitted, teams are inferred from the NBA schedule for --date."
-        ),
+        type=str,
+        default="",
+        help="Comma-separated list of team abbreviations (e.g. 'CHI,CLE,MEM,MIN').",
     )
     parser.add_argument(
         "--max-games",
         type=int,
         default=-1,
-        help=(
-            "Max number of games to consider when building impact ratings "
-            "(passed through to export_impact_ratings.py). "
-            "Use -1 (default) to use all completed games for the season."
-        ),
+        help="Max number of games per team to process when updating DB / impact.",
     )
     parser.add_argument(
         "--upload-s3",
         action="store_true",
-        help="If set, also upload gameday player profiles to S3 (gameday bucket/prefix).",
+        help="If set, upload gameday profiles and combined predictions to S3.",
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        type=str,
+        default=DEFAULT_S3_BUCKET,
+        help="S3 bucket to upload to when --upload-s3 is set.",
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        type=str,
+        default=DEFAULT_S3_PREFIX,
+        help="S3 key prefix (e.g. 'gameday') when --upload-s3 is set.",
+    )
+    return parser.parse_args()
+
+
+def infer_season_label(gameday_date: dt.date) -> str:
+    """Infer NBA season label (e.g. '2025-26') from a game date.
+
+    Assumes seasons start in October and span two calendar years.
+    """
+    year = gameday_date.year
+    if gameday_date.month >= 10:
+        start_year = year
+    else:
+        start_year = year - 1
+    end_year_short = (start_year + 1) % 100
+    return f"{start_year}-{end_year_short:02d}"
+
+
+def infer_teams_for_date(
+    gameday_date: dt.date, season_label: str | None = None
+) -> List[str]:
+    """Infer the set of team abbreviations playing on a given date.
+
+    Uses the shared NBA schedule helper so behavior matches other
+    scripts (e.g. check_db_coverage, matchup exports).
+    """
+    date_str = gameday_date.isoformat()
+    try:
+        raw = get_schedule_for_date(date_str, season_label=season_label)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise RuntimeError(
+            "Failed to infer today's teams from schedule; "
+            "please pass --teams explicitly."
+        ) from exc
+
+    if isinstance(raw, pd.DataFrame):
+        df = raw.copy()
+    else:
+        df = pd.DataFrame(raw)
+
+    if df.empty:
+        raise RuntimeError(
+            f"No games found in schedule for {date_str}; "
+            "please pass --teams explicitly."
+        )
+
+    # Try a variety of likely column names for team tricodes/abbreviations.
+    candidate_home_cols = [
+        "HOME_TEAM_ABBREVIATION",
+        "home_team_abbreviation",
+        "homeTeam_teamTricode",
+        "home_team_tricode",
+        "homeTeam_tricode",
+    ]
+    candidate_away_cols = [
+        "VISITOR_TEAM_ABBREVIATION",
+        "away_team_abbreviation",
+        "awayTeam_teamTricode",
+        "away_team_tricode",
+        "awayTeam_tricode",
+    ]
+
+    home_col = next((c for c in candidate_home_cols if c in df.columns), None)
+    away_col = next((c for c in candidate_away_cols if c in df.columns), None)
+
+    if home_col is None or away_col is None:
+        raise RuntimeError(
+            "Could not locate home/away team abbreviation columns in schedule "
+            f"for {date_str}. Available columns: {list(df.columns)}"
+        )
+
+    teams_set = set(
+        df[home_col].dropna().astype(str).str.upper().tolist()
+        + df[away_col].dropna().astype(str).str.upper().tolist()
     )
 
-    return parser.parse_args(argv)
+    teams = sorted(t for t in teams_set if t)
+    if not teams:
+        raise RuntimeError(
+            f"Schedule for {date_str} did not contain any team abbreviations; "
+            "please pass --teams explicitly."
+        )
+
+    return teams
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    args = parse_args(argv)
+def run_cmd(cmd: List[str]) -> None:
+    print(f"\n💻 Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        print(f"❌ Command failed with code {result.returncode}: {' '.join(cmd)}")
+        sys.exit(result.returncode)
 
-    season_label: str = args.season_label
-    date_str: str = args.date or _get_today_ymd()
-    max_games: int = args.max_games
-    upload_s3: bool = args.upload_s3
+
+def main() -> None:
+    args = parse_args()
+
+    # Resolve date
+    if args.date is not None:
+        gameday_date = dt.date.fromisoformat(args.date)
+    else:
+        gameday_date = dt.date.today()
+
+    gameday_date_str = gameday_date.isoformat()
+
+    # Resolve season label (allow auto-infer from date)
+    season_label = args.season_label or infer_season_label(gameday_date)
+
+    # Resolve teams (explicit or inferred from schedule)
+    if args.teams.strip():
+        teams = [t.strip().upper() for t in args.teams.split(",") if t.strip()]
+        print(f"📌 Using explicit teams from CLI: {teams}")
+    else:
+        print("📌 No --teams supplied; inferring teams from NBA schedule ...")
+        teams = infer_teams_for_date(gameday_date, season_label=season_label)
+        print(f"📌 Using inferred gameday teams: {teams}")
+
+    teams_csv = ",".join(teams)
+
+    # S3 info
+    upload_s3 = args.upload_s3
+    s3_bucket = args.s3_bucket
+    s3_prefix = args.s3_prefix
 
     print("====================================")
     print("🏀 Daily Player Pipeline")
     print("====================================")
-    print(f"📅 Date:          {date_str}")
+    print(f"📅 Date:          {gameday_date_str}")
     print(f"📆 Season label:  {season_label}")
-    print(f"🎮 Max games:     {max_games}")
+    print(f"🎮 Max games:     {args.max_games}")
     print(f"☁️ Upload to S3:  {'yes' if upload_s3 else 'no'}")
+    print(f"📌 Teams:         {teams}")
+    print("====================================")
 
-    # Resolve team list
-    if args.teams and len(args.teams) > 0:
-        teams = _normalize_team_list(args.teams)
-        if not teams:
-            raise RuntimeError(
-                f"--teams was provided ({args.teams}) but no valid team codes were parsed."
-            )
-        print(f"📌 Using explicit teams from CLI: {teams}")
-    else:
-        # Auto-detect from NBA schedule for the given date using ScheduleLeagueV2
-        teams = _get_teams_playing_on_date(date_str, season_label)
-        if not teams:
-            raise RuntimeError(
-                f"No games found in the schedule for {date_str} (season={season_label}). "
-                "Provide --teams explicitly if this is unexpected."
-            )
-
-    # 1) Update DB once for all teams via update_db_today.py
+    # 1️⃣ DB update ------------------------------------------------------------
     print("\n------------------------------------")
     print(
         "1️⃣ [DB] Updating player stats for all target teams via update_db_today.py ..."
     )
 
-    db_cmd: list[str] = [
+    cmd = [
         sys.executable,
         "src/scripts/update_db_today.py",
         "--max-games",
-        str(max_games),
+        str(args.max_games),
+        "--teams",
+        teams_csv,
     ]
-
-    # Pass teams as a single comma-separated string, e.g. "NYK,SAS"
-    if teams:
-        db_cmd.extend(["--teams", ",".join(teams)])
-
-    _run_cmd(db_cmd)
-
+    run_cmd(cmd)
     print("✅ Daily DB update complete.")
     print(f"   Updated teams: {teams}")
 
-    # 2) Rebuild season profiles from DB once for all target teams
+    # 2️⃣ Season profiles from DB ---------------------------------------------
     print("\n------------------------------------")
     print("2️⃣ [Profiles] Rebuilding season profiles from DB for all target teams ...")
 
-    profiles_cmd: list[str] = [
+    cmd = [
         sys.executable,
         "src/scripts/export_profiles_from_db.py",
         "--season-label",
         season_label,
         "--team",
-        ",".join(teams),
+        teams_csv,
     ]
-    _run_cmd(profiles_cmd)
+    run_cmd(cmd)
 
-    # 3) Export impact ratings per team (and persist to DB)
+    # 3️⃣ Impact ratings -------------------------------------------------------
+    print("\n------------------------------------")
     for team in teams:
-        print("\n------------------------------------")
         print(f"🏷️  Team: {team}")
-        print("------------------------------------")
+        print("3️⃣ [Impact] Exporting impact ratings ...")
 
-        print(f"3️⃣ [Impact] Exporting impact ratings for {team} ...")
-        _run_cmd(
-            [
-                sys.executable,
-                "src/scripts/export_impact_ratings.py",
-                "--team",
-                team,
-                "--season-label",
-                season_label,
-                "--max-games",
-                str(max_games),
-            ]
-        )
+        cmd = [
+            sys.executable,
+            "src/scripts/export_impact_ratings.py",
+            "--team",
+            team,
+            "--season-label",
+            season_label,
+            "--max-games",
+            str(args.max_games),
+        ]
+        run_cmd(cmd)
 
-        print(f"✅ Finished impact export for {team}.")
-
-    # 4) Export gameday player profiles (once, for the full set of teams)
+    # 4️⃣ Gameday player profiles ---------------------------------------------
     print("\n------------------------------------")
     print("4️⃣ [Gameday] Exporting gameday player profiles ...")
 
-    gameday_cmd: list[str] = [
+    cmd = [
         sys.executable,
         "src/scripts/export_gameday_profiles.py",
         "--season-label",
         season_label,
         "--teams",
-        ",".join(teams),
+        teams_csv,
     ]
-
     if upload_s3:
-        gameday_cmd.extend(
+        cmd.extend(
             [
                 "--s3-bucket",
-                S3_BUCKET_DEFAULT,
+                s3_bucket,
                 "--s3-prefix",
-                S3_PREFIX_DEFAULT,
+                s3_prefix,
             ]
         )
+    run_cmd(cmd)
 
-    _run_cmd(gameday_cmd)
-
-    # 5) Export gameday matchup features
+    # 5️⃣ Gameday matchup features --------------------------------------------
     print("\n------------------------------------")
     print("5️⃣ [Matchups] Exporting gameday matchup features ...")
 
-    matchup_cmd: list[str] = [
+    cmd = [
         sys.executable,
         "src/scripts/export_gameday_matchups.py",
         "--season-label",
         season_label,
         "--date",
-        date_str,
+        gameday_date_str,
         "--teams",
-        ",".join(teams),
+        teams_csv,
     ]
+    run_cmd(cmd)
 
-    _run_cmd(matchup_cmd)
-
-    # 6) Generate team-level matchup predictions using the trained models
+    # 6️⃣ Team-level matchup predictions --------------------------------------
     print("\n------------------------------------")
     print("6️⃣ [Team Predictions] Generating team-level matchup predictions ...")
 
-    predict_cmd: list[str] = [
+    cmd = [
         sys.executable,
         "src/scripts/predict_team_matchups.py",
         "--season-label",
         season_label,
         "--date",
-        date_str,
+        gameday_date_str,
     ]
+    run_cmd(cmd)
 
-    _run_cmd(predict_cmd)
+    # 7️⃣ Player-level stat predictions ---------------------------------------
+    print("\n------------------------------------")
+    print("7️⃣ [Player Predictions] Generating gameday player stat predictions ...")
 
+    # We rely on defaults in predict_gameday_players.py for:
+    #   --train-json, --models-dir, --gameday-profiles
+    cmd = [
+        sys.executable,
+        "src/scripts/predict_gameday_players.py",
+        "--date",
+        gameday_date_str,
+    ]
+    run_cmd(cmd)
+
+    # 8️⃣ Combined matchup + player package -----------------------------------
+    print("\n------------------------------------")
+    print(
+        "8️⃣ [Package] Combining team+player predictions into matchup file "
+        "and uploading to S3 (if enabled) ..."
+    )
+
+    cmd = [
+        sys.executable,
+        "src/scripts/export_gameday_predictions.py",
+        "--date",
+        gameday_date_str,
+    ]
+    if upload_s3:
+        cmd.extend(
+            [
+                "--s3-bucket",
+                s3_bucket,
+                "--s3-prefix",
+                s3_prefix,
+            ]
+        )
+    run_cmd(cmd)
+
+    # Done --------------------------------------------------------------------
     print("\n🎉 Daily pipeline completed successfully!")
-    print(f"   Date:   {date_str}")
+    print(f"   Date:   {gameday_date_str}")
     print(f"   Season: {season_label}")
     print(f"   Teams:  {teams}")
 
